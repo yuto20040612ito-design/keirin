@@ -217,7 +217,9 @@ def load_odds(con, root: Path) -> int:
 
         fetched = _iso(rec.get("fetched_at"))
         official = _ts(payload.get("official_dt"))
-        snapshot = _iso(params.get("snapshot_at")) or fetched
+        # 確定オッズは official_dt の時点の値。バックフィルでは取得時刻が
+        # レースの何ヶ月も後になるので、それを snapshot_at にしてはいけない。
+        snapshot = official or _iso(params.get("snapshot_at")) or fetched
         if snapshot is None:
             continue
 

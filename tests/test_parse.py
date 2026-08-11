@@ -207,3 +207,34 @@ class TestResultParsing:
     def test_last_lap_time(self):
         assert self.rows[5][5] == 11.8
         assert self.rows[7][5] is None
+
+
+# ---------------------------------------------------------------------------
+# 収集済み索引 (バックフィルの再開に必要)
+# ---------------------------------------------------------------------------
+
+from keirin.manifest import Manifest  # noqa: E402
+
+
+class TestManifest:
+    def test_mark_and_has(self, tmp_path):
+        m = Manifest(tmp_path)
+        assert not m.has("AplRaceOdds", "R1")
+        m.mark("AplRaceOdds", "R1")
+        assert m.has("AplRaceOdds", "R1")
+
+    def test_survives_process_restart(self, tmp_path):
+        """中断して再実行したとき、続きから再開できなければ意味がない。"""
+        Manifest(tmp_path).mark("AplRaceOdds", "R1")
+        assert Manifest(tmp_path).has("AplRaceOdds", "R1")
+
+    def test_kinds_are_independent(self, tmp_path):
+        m = Manifest(tmp_path)
+        m.mark("AplRaceOdds", "R1")
+        assert not m.has("result_html", "R1")
+
+    def test_marking_twice_does_not_duplicate(self, tmp_path):
+        m = Manifest(tmp_path)
+        m.mark("AplRaceOdds", "R1")
+        m.mark("AplRaceOdds", "R1")
+        assert (tmp_path / "manifest" / "AplRaceOdds.txt").read_text().count("R1") == 1

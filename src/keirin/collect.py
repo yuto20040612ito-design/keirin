@@ -33,6 +33,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from . import rawstore
+from .manifest import Manifest
 from .netkeirin import NetkeirinClient, NetkeirinError, parse_line_forecast
 
 JST = ZoneInfo("Asia/Tokyo")
@@ -383,6 +384,107 @@ def collect_results(
 
 
 # ---------------------------------------------------------------------------
+# Phase 1: 過去データのバックフィル
+# ---------------------------------------------------------------------------
+
+# 過去レースで取得できるもの。オッズは確定オッズが1点だけ返る。
+# 締切前の推移は遡れないが、確定オッズは市場の最終評価そのものなので
+# Phase 2 のベースライン比較には十分使える。
+BACKFILL_KINDS = ("AplRaceHorse", "AplNarabiYoso", "AplRaceOdds", "result_html")
+
+
+def _fetch_one(
+    client: NetkeirinClient, root: Path, kind: str, race: Race
+) -> bool:
+    try:
+        if kind == "result_html":
+            payload = client.get_html("race/result/", race_id=race.race_id)
+        elif kind == "AplRaceHorse":
+            payload = client.entries(race.race_id)
+        elif kind == "AplNarabiYoso":
+            payload = client.narabi(race.race_id)
+        elif kind == "AplRaceOdds":
+            payload = client.odds(race.race_id)
+        else:
+            raise ValueError(f"unknown kind: {kind}")
+    except NetkeirinError as exc:
+        log.warning("%s %s failed: %s", race.race_id, kind, exc)
+        return False
+
+    params: dict = {"race_id": race.race_id}
+    if kind == "AplRaceOdds":
+        params["close_at"] = race.close_at.isoformat() if race.close_at else None
+    rawstore.append(root, kind, race.kaisai_date, params, payload)
+    return True
+
+
+def backfill(
+    client: NetkeirinClient,
+    root: Path,
+    date_from: str,
+    date_to: str,
+    kinds: tuple[str, ...] = BACKFILL_KINDS,
+) -> None:
+    """期間内の過去データを収集する。中断しても再開できる。
+
+    1レースあたり len(kinds) リクエスト。全場だと1日およそ80レースなので、
+    1.5秒間隔・4種で1日分に約8分かかる。1年分なら数十時間の作業になる。
+    夜間に流し続ける前提で、いつ止めても続きから再開できるようにしてある。
+    """
+    man = Manifest(root)
+    start = datetime.strptime(date_from, "%Y%m%d").date()
+    end = datetime.strptime(date_to, "%Y%m%d").date()
+    if start > end:
+        raise ValueError("date_from must not be after date_to")
+
+    calendars: dict[int, list[dict]] = {}
+    total_done = total_skipped = 0
+    day = start
+    while day <= end:
+        date_str = day.strftime("%Y%m%d")
+        day += timedelta(days=1)
+
+        year = int(date_str[:4])
+        if year not in calendars:
+            try:
+                calendars[year] = fetch_calendar(client, root, year)
+            except NetkeirinError as exc:
+                log.error("calendar %d failed: %s -- skipping year", year, exc)
+                calendars[year] = []
+
+        if not jyo_for_date(calendars[year], date_str):
+            continue  # 非開催日
+
+        if man.has("dates", date_str):
+            log.info("%s: already complete, skipping", date_str)
+            continue
+
+        races = load_day(client, root, date_str, calendars[year])
+        if not races:
+            continue
+
+        day_done = 0
+        for race in races:
+            for kind in kinds:
+                if man.has(kind, race.race_id):
+                    total_skipped += 1
+                    continue
+                if _fetch_one(client, root, kind, race):
+                    man.mark(kind, race.race_id)
+                    day_done += 1
+                    total_done += 1
+        man.mark("dates", date_str)
+        log.info(
+            "%s: %d races, %d fetched (total %d fetched / %d skipped)",
+            date_str,
+            len(races),
+            day_done,
+            total_done,
+            total_skipped,
+        )
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -405,6 +507,18 @@ def main(argv: list[str] | None = None) -> int:
 
     rs = sub.add_parser("results", help="確定結果ページをバックフィル")
     rs.add_argument("--date", required=True, help="YYYYMMDD")
+
+    bf = sub.add_parser("backfill", help="過去データを収集 (Phase 1。中断・再開可)")
+    bf.add_argument("--from", dest="date_from", required=True, help="YYYYMMDD")
+    bf.add_argument("--to", dest="date_to", required=True, help="YYYYMMDD")
+    bf.add_argument(
+        "--kinds",
+        default=",".join(BACKFILL_KINDS),
+        help=f"収集対象をカンマ区切りで指定 (既定: {','.join(BACKFILL_KINDS)})",
+    )
+
+    rb = sub.add_parser("rebuild-manifest", help="raw から収集済み索引を作り直す")
+    rb.add_argument("--kinds", default=",".join(BACKFILL_KINDS))
 
     args = p.parse_args(argv)
     logging.basicConfig(
@@ -438,6 +552,23 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "results":
         cal = fetch_calendar(client, root, int(args.date[:4]))
         collect_results(client, root, args.date, cal)
+        return 0
+
+    if args.cmd == "backfill":
+        kinds = tuple(k.strip() for k in args.kinds.split(",") if k.strip())
+        unknown = set(kinds) - set(BACKFILL_KINDS)
+        if unknown:
+            p.error(f"unknown kinds: {', '.join(sorted(unknown))}")
+        try:
+            backfill(client, root, args.date_from, args.date_to, kinds)
+        except KeyboardInterrupt:
+            log.info("interrupted -- rerun the same command to resume")
+        return 0
+
+    if args.cmd == "rebuild-manifest":
+        kinds = [k.strip() for k in args.kinds.split(",") if k.strip()]
+        for kind, n in Manifest(root).rebuild(kinds).items():
+            log.info("%-15s %6d keys", kind, n)
         return 0
 
     return 1

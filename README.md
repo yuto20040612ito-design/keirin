@@ -59,12 +59,48 @@ python -m keirin.collect watch
 # 確定した結果・払戻をバックフィル
 python -m keirin.collect results --date 20260811
 
+# 過去データをまとめて収集 (Phase 1)。中断しても同じコマンドで再開できる
+python -m keirin.collect backfill --from 20260101 --to 20260811
+
 # raw -> DuckDB
 python -m keirin.load --data-root data --db data/keirin.duckdb
 ```
 
+### 常駐させる
+
 `watch` は日付が変わると当日の開催を自動で読み直すので、
-`systemd` や `supervisor` で常駐させておけばよい。
+起動しっぱなしにしておけばよい。systemd ユニットを
+[`deploy/keirin-collect.service`](deploy/keirin-collect.service) に置いてある。
+
+```bash
+sudo cp deploy/keirin-collect.service /etc/systemd/system/
+sudo systemctl enable --now keirin-collect
+journalctl -u keirin-collect -f
+```
+
+### バックフィルの所要時間
+
+1レースあたり4リクエスト（出走・ライン・オッズ・結果）。
+全場だと1日およそ80レースなので、1.5秒間隔で**1日分に約8分**かかる。
+1年分なら数十時間の連続作業になる。
+
+夜間に流し続ける前提で、いつ止めても続きから再開できるようにしてある。
+収集済みのキーは `data/manifest/` に記録され、再実行時はスキップされる。
+索引を壊した場合は raw から作り直せる:
+
+```bash
+python -m keirin.collect rebuild-manifest
+```
+
+`--kinds` で対象を絞れる。まず結果とオッズだけ集めたいなら:
+
+```bash
+python -m keirin.collect backfill --from 20260101 --to 20260811 \
+    --kinds AplRaceOdds,result_html
+```
+
+**過去レースのオッズは確定オッズ1点のみ**で、締切前の推移は遡れない。
+推移が欲しければ `watch` を今日から回すしかない。
 
 ### オッズを刻む間隔
 
@@ -98,8 +134,33 @@ data/keirin.duckdb                                  ← 正規化テーブル。
 | `results` | 着順, 着差, 上りタイム, **決まり手**, S/B |
 | `payouts` | 全賭式の確定払戻・人気 |
 
-`final_odds` ビューは各組番の最終オッズ（＝実際に買えた価格）を返す。
-**バックテストは必ずこれを使うこと。**
+### 判断に使うオッズと精算に使うオッズは別物
+
+混同すると回収率を誤るので、ビューを分けてある。
+
+| ビュー | 中身 | 使いどころ |
+|---|---|---|
+| `decision_odds` | 締切前に実際に見られた最後のオッズ | モデルの市場特徴量・購入判断 |
+| `final_odds` | 確定オッズ（無ければ最後のスナップショット） | 回収率の計算 |
+
+パリミュチュエルなので、いつ買っても受け取る価格は最終プールで決まる＝`final_odds`。
+一方で買うかどうかを決める時点で見えているのは `decision_odds` まで。
+**判断は `decision_odds`、精算は `final_odds`。逆にすると幻の利益が出る。**
+
+### データが正しいかの確認方法
+
+オッズが全組番そろっていれば `1/Σ(1/オッズ)` が払戻率（約75%）になる。
+組番が欠けても重複しても、この値がずれる。取り込み後の健全性チェックに使える。
+
+```sql
+SELECT bet_type, round(avg(1.0/inv)*100, 1) AS payback_pct
+FROM (SELECT race_id, bet_type, sum(1.0/odds_low) AS inv
+      FROM final_odds WHERE odds_low IS NOT NULL AND bet_type <> 7
+      GROUP BY 1, 2)
+GROUP BY 1;
+```
+
+実測値（20260810 の59レース）: 2車複 73.9% / 2車単 74.4% / 3連複 74.4% / 3連単 74.8%。
 
 ---
 

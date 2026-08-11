@@ -1,0 +1,36 @@
+# オッズ収集の常駐ユニット。
+#
+# 締切前オッズは取り逃すと永久に手に入らないので、
+# 落ちたら必ず再起動する設定にしてある。
+#
+#   sudo cp deploy/keirin-collect.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now keirin-collect
+#   journalctl -u keirin-collect -f
+#
+# WorkingDirectory と User は自分の環境に合わせて書き換えること。
+
+[Unit]
+Description=keirin odds collector (Phase 0)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=keirin
+WorkingDirectory=/opt/keirin
+Environment=PYTHONPATH=/opt/keirin/src
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -m keirin.collect --data-root /opt/keirin/data watch
+
+# 収集の空白を作らないため、どんな終わり方でも必ず戻す
+Restart=always
+RestartSec=30
+
+# 収集データは失うと取り返せないので、書き込み先だけは確実に確保する
+ReadWritePaths=/opt/keirin/data
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -160,12 +160,20 @@ CREATE TABLE IF NOT EXISTS odds_snapshots (
 CREATE INDEX IF NOT EXISTS idx_odds_race ON odds_snapshots (race_id, bet_type);
 CREATE INDEX IF NOT EXISTS idx_odds_close ON odds_snapshots (race_id, secs_to_close);
 
--- 締切「前」の最終オッズ(＝実際に買えた価格)。バックテストは必ずこれを使う。
--- secs_to_close >= 0 に限定しているのは、締切後に付いた確定オッズでは買えないため。
--- ここを緩めると、実際には買えない価格で幻の利益が出る。
-CREATE OR REPLACE VIEW final_odds AS
-SELECT race_id, bet_type, combination, snapshot_at, official_dt, is_official,
-       odds_low, odds_high, popularity, secs_to_close
+-- 「判断に使うオッズ」と「精算に使うオッズ」は別物。混同すると ROI を誤る。
+--
+--   decision_odds … 締切前に自分が実際に見られた最後のオッズ。
+--                   モデルの市場特徴量・購入判断はこちらを使う。
+--                   締切後のスナップショットを混ぜると未来を見たことになる。
+--
+--   final_odds    … 確定オッズ。パリミュチュエルでは払戻が最終プールで決まるため、
+--                   いつ買っても受け取る価格はこれ。回収率の計算はこちらを使う。
+--
+-- 判断は decision_odds、精算は final_odds。これを逆にすると幻の利益が出る。
+
+CREATE OR REPLACE VIEW decision_odds AS
+SELECT race_id, bet_type, combination, snapshot_at, odds_low, odds_high,
+       popularity, secs_to_close
 FROM (
     SELECT *,
            ROW_NUMBER() OVER (
@@ -174,6 +182,19 @@ FROM (
            ) AS rn
     FROM odds_snapshots
     WHERE secs_to_close IS NOT NULL AND secs_to_close >= 0
+) WHERE rn = 1;
+
+-- 確定オッズを優先し、無ければ最後のスナップショットで代用する。
+CREATE OR REPLACE VIEW final_odds AS
+SELECT race_id, bet_type, combination, snapshot_at, official_dt, is_official,
+       odds_low, odds_high, popularity, secs_to_close
+FROM (
+    SELECT *,
+           ROW_NUMBER() OVER (
+               PARTITION BY race_id, bet_type, combination
+               ORDER BY is_official DESC, snapshot_at DESC
+           ) AS rn
+    FROM odds_snapshots
 ) WHERE rn = 1;
 
 -- ---------------------------------------------------------------------------
