@@ -1,0 +1,37 @@
+[project]
+name = "keirin"
+version = "0.1.0"
+description = "競輪の予測・期待値評価のためのデータベースと収集基盤"
+requires-python = ">=3.11"
+# 収集 (keirin.collect) は標準ライブラリのみで動く。
+# 何ヶ月も回り続けるプロセスなので、依存で壊れるリスクを持ち込まない。
+dependencies = []
+
+[project.optional-dependencies]
+# DuckDB への投入と分析
+analysis = [
+    "duckdb>=1.0",
+    "polars>=1.0",
+    "pyarrow>=16",
+]
+# モデリング (Phase 3 以降)
+model = [
+    "lightgbm>=4.0",
+    "scikit-learn>=1.4",
+    "numpy>=1.26",
+    "scipy>=1.12",
+]
+dev = [
+    "pytest>=8.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

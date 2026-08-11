@@ -1,0 +1,209 @@
+"""パース関数のテスト。
+
+ここで守りたいのは主に2点:
+  * ライン区切り("0")の解釈を壊さないこと — 競輪で最重要の構造情報なので
+  * 締切時刻の日跨ぎ補正を場ごとに評価すること — R番号は場をまたいで重複する
+"""
+
+from datetime import datetime
+
+from keirin.collect import JST, Race, _fix_midnight_rollover, _parse_hhmm
+from keirin.netkeirin import iter_odds_rows, parse_line_forecast
+
+
+class TestParseLineForecast:
+    def test_splits_on_zero(self):
+        payload = {"lineForecast": [["5", "1", "7", "0", "2", "4", "3", "0", "6"]]}
+        assert parse_line_forecast(payload) == [[5, 1, 7], [2, 4, 3], [6]]
+
+    def test_single_line(self):
+        assert parse_line_forecast({"lineForecast": [["1", "2", "3"]]}) == [[1, 2, 3]]
+
+    def test_all_solo(self):
+        payload = {"lineForecast": [["1", "0", "2", "0", "3"]]}
+        assert parse_line_forecast(payload) == [[1], [2], [3]]
+
+    def test_trailing_and_leading_separators_do_not_create_empty_lines(self):
+        payload = {"lineForecast": [["0", "1", "2", "0", "0", "3", "0"]]}
+        assert parse_line_forecast(payload) == [[1, 2], [3]]
+
+    def test_empty(self):
+        assert parse_line_forecast({}) == []
+        assert parse_line_forecast({"lineForecast": []}) == []
+
+    def test_non_numeric_tokens_are_skipped(self):
+        payload = {"lineForecast": [["1", "x", "2"]]}
+        assert parse_line_forecast(payload) == [[1, 2]]
+
+
+class TestIterOddsRows:
+    def test_parses_bet_types_and_combinations(self):
+        payload = {
+            "official_dt": "2026-08-11 10:46:00",
+            "list_5": [["0102", "3.2", "0", "2"]],
+            "list_9": [["010203", "91.9", "0", "26"]],
+        }
+        rows = sorted(iter_odds_rows(payload))
+        assert rows == [
+            (5, "0102", 3.2, None, 2),
+            (9, "010203", 91.9, None, 26),
+        ]
+
+    def test_wide_keeps_upper_bound(self):
+        payload = {"list_7": [["0102", "1.6", "2.1", "2"]]}
+        assert list(iter_odds_rows(payload)) == [(7, "0102", 1.6, 2.1, 2)]
+
+    def test_zero_odds_becomes_none(self):
+        """発売前などオッズ 0 は「値なし」であって 0.0 倍ではない。"""
+        payload = {"list_5": [["0102", "0", "0", "0"]]}
+        assert list(iter_odds_rows(payload)) == [(5, "0102", None, None, 0)]
+
+    def test_ignores_non_list_keys(self):
+        payload = {"official_dt": "2026-08-11 10:46:00", "list_5": []}
+        assert list(iter_odds_rows(payload)) == []
+
+    def test_malformed_rows_are_skipped(self):
+        payload = {"list_5": [["0102"], ["0103", "2.0", "0", "1"]]}
+        assert list(iter_odds_rows(payload)) == [(5, "0103", 2.0, None, 1)]
+
+
+class TestParseHhmm:
+    def test_basic(self):
+        assert _parse_hhmm("20260811", "10:40") == datetime(
+            2026, 8, 11, 10, 40, tzinfo=JST
+        )
+
+    def test_hour_24_rolls_to_next_day(self):
+        assert _parse_hhmm("20260811", "24:10") == datetime(
+            2026, 8, 12, 0, 10, tzinfo=JST
+        )
+
+    def test_invalid(self):
+        assert _parse_hhmm("20260811", "") is None
+        assert _parse_hhmm("20260811", "abc") is None
+
+
+def _race(race_id, jyo_cd, race_no, close_hhmm):
+    return Race(
+        race_id=race_id,
+        kaisai_date="20260811",
+        jyo_cd=jyo_cd,
+        jyo=jyo_cd,
+        race_no=race_no,
+        race_name="",
+        tosu=7,
+        close_at=_parse_hhmm("20260811", close_hhmm),
+        start_at=None,
+    )
+
+
+class TestMidnightRollover:
+    def test_does_not_shift_normal_schedule(self):
+        """異なる場のR番号が重複していても、正常な時刻をずらしてはいけない。"""
+        races = [
+            _race("202608113501", "35", 1, "08:25"),
+            _race("202608112101", "21", 1, "10:40"),
+            _race("202608114809", "48", 9, "23:25"),
+        ]
+        _fix_midnight_rollover(races)
+        assert races[0].close_at == datetime(2026, 8, 11, 8, 25, tzinfo=JST)
+        assert races[1].close_at == datetime(2026, 8, 11, 10, 40, tzinfo=JST)
+        assert races[2].close_at == datetime(2026, 8, 11, 23, 25, tzinfo=JST)
+
+    def test_shifts_when_time_goes_backwards_within_same_venue(self):
+        races = [
+            _race("202608114808", "48", 8, "23:40"),
+            _race("202608114809", "48", 9, "00:05"),
+        ]
+        _fix_midnight_rollover(races)
+        assert races[0].close_at == datetime(2026, 8, 11, 23, 40, tzinfo=JST)
+        assert races[1].close_at == datetime(2026, 8, 12, 0, 5, tzinfo=JST)
+
+    def test_missing_close_time_is_tolerated(self):
+        races = [_race("202608114801", "48", 1, ""), _race("202608114802", "48", 2, "10:00")]
+        _fix_midnight_rollover(races)
+        assert races[0].close_at is None
+        assert races[1].close_at == datetime(2026, 8, 11, 10, 0, tzinfo=JST)
+
+
+# ---------------------------------------------------------------------------
+# 結果ページ HTML のパース
+# ---------------------------------------------------------------------------
+
+from keirin.load import _parse_payout_table, _parse_result_table  # noqa: E402
+
+
+PAYOUT_HTML = """
+<table class="Payout_Detail_Table">
+<tr><th>２車複</th><td>1-5</td><td>240円</td><td>1人気</td></tr>
+<tr><th>２車単</th><td>5&gt;1</td><td>750円</td><td>3人気</td></tr>
+<tr><th>ワイド</th><td>1-5</td><td>140円</td><td>1人気</td></tr>
+<tr><td>2-5</td><td>200円</td><td>3人気</td></tr>
+<tr><th>３連複</th><td>1-2-5</td><td>240円</td><td>1人気</td></tr>
+<tr><th>３連単</th><td>5&gt;1&gt;2</td><td>2,280円</td><td>7人気</td></tr>
+</table>
+"""
+
+
+class TestPayoutParsing:
+    def setup_method(self):
+        self.rows = _parse_payout_table(PAYOUT_HTML, "R1", None)
+        self.by_type = {(r[1], r[2]): r for r in self.rows}
+
+    def test_ordered_bets_survive_html_entity_escaping(self):
+        """'5&gt;1' を復元しないと2車単・3連単の払戻が丸ごと落ちる(実際に踏んだバグ)。"""
+        assert (6, "0501") in self.by_type
+        assert (9, "050102") in self.by_type
+
+    def test_combination_is_zero_padded_to_match_odds_format(self):
+        """払戻の組番は odds_snapshots.combination と同形式でなければ JOIN できない。"""
+        assert self.by_type[(5, "0105")][2] == "0105"
+        assert self.by_type[(8, "010205")][2] == "010205"
+
+    def test_payout_amount_strips_comma(self):
+        assert self.by_type[(9, "050102")][3] == 2280
+
+    def test_popularity(self):
+        assert self.by_type[(9, "050102")][4] == 7
+
+    def test_bet_type_carries_over_to_continuation_rows(self):
+        """ワイドは1レース3組で、2組目以降は賭式名のセルを持たない。"""
+        assert (7, "0105") in self.by_type
+        assert (7, "0205") in self.by_type
+
+
+RESULT_HTML = """
+<table class="RaceCard_Table ResultRefund">
+<tr><th>着</th><th>枠番</th><th>車番</th><th>選手名</th><th>着差</th><th>上り</th><th>決</th><th>SB</th></tr>
+<tr><td>1着</td><td>5</td><td>5</td><td>森崎英登</td><td></td><td>11.8</td><td>逃</td><td>B</td></tr>
+<tr><td>2着</td><td>1</td><td>1</td><td>渡邊健</td><td>2車身</td><td>11.9</td><td>ク</td><td>S</td></tr>
+<tr><td>棄</td><td>6</td><td>7</td><td>吉村文隆</td><td>－ (落車棄権)</td><td></td><td></td><td></td></tr>
+</table>
+"""
+
+
+class TestResultParsing:
+    def setup_method(self):
+        self.rows = {r[1]: r for r in _parse_result_table(RESULT_HTML, "R1", None)}
+
+    def test_finish_positions(self):
+        assert self.rows[5][2] == 1
+        assert self.rows[1][2] == 2
+
+    def test_abnormal_finish_is_kept_with_null_position(self):
+        """落車・失格の履歴は展開予測に効くので捨てない(実際に取りこぼしたバグ)。"""
+        assert 7 in self.rows, "落車棄権の選手が丸ごと落ちている"
+        assert self.rows[7][2] is None
+        assert self.rows[7][3] == "落車棄権"
+
+    def test_header_row_is_ignored(self):
+        assert len(self.rows) == 3
+
+    def test_kimarite_and_sb(self):
+        assert self.rows[5][6] == "逃"
+        assert self.rows[5][8] is True   # got_b
+        assert self.rows[1][7] is True   # got_s
+
+    def test_last_lap_time(self):
+        assert self.rows[5][5] == 11.8
+        assert self.rows[7][5] is None

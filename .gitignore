@@ -1,0 +1,14 @@
+# 収集データは巨大かつ再生成不能。Git ではなく別途バックアップすること。
+data/
+*.duckdb
+*.duckdb.wal
+*.parquet
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
