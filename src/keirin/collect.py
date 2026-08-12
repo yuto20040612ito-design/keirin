@@ -32,7 +32,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from . import rawstore
+from . import keirinjp, rawstore
 from .manifest import Manifest
 from .netkeirin import NetkeirinClient, NetkeirinError, parse_line_forecast
 
@@ -531,6 +531,8 @@ def main(argv: list[str] | None = None) -> int:
     rb = sub.add_parser("rebuild-manifest", help="raw から収集済み索引を作り直す")
     rb.add_argument("--kinds", default=",".join(BACKFILL_KINDS))
 
+    sub.add_parser("velodromes", help="公式からバンク諸元を取得 (年1回で足りる)")
+
     args = p.parse_args(argv)
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -574,6 +576,24 @@ def main(argv: list[str] | None = None) -> int:
             backfill(client, root, args.date_from, args.date_to, kinds)
         except KeyboardInterrupt:
             log.info("interrupted -- rerun the same command to resume")
+        return 0
+
+    if args.cmd == "velodromes":
+        codes = keirinjp.list_velodrome_codes(client)
+        log.info("%d velodromes", len(codes))
+        saved = 0
+        for code in codes:
+            try:
+                markup = keirinjp.fetch_velodrome(client, code)
+            except NetkeirinError as exc:
+                log.warning("jocd=%s failed: %s", code, exc)
+                continue
+            rawstore.append(
+                root, "velodrome_html", datetime.now(JST).strftime("%Y%m%d"),
+                {"jyo_cd": code}, markup,
+            )
+            saved += 1
+        log.info("saved %d/%d velodromes", saved, len(codes))
         return 0
 
     if args.cmd == "rebuild-manifest":

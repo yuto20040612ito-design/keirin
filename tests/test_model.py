@@ -56,10 +56,17 @@ def _add_lines(con, lines):
             )
 
 
-def _make_db(win_probs=(0.5, 0.3, 0.2), winner_syaban=1, lines=([1, 2], [3])):
+def _make_db(win_probs=(0.5, 0.3, 0.2), winner_syaban=1, lines=([1, 2], [3]),
+             velodrome=True):
     con = duckdb.connect(":memory:")
     con.execute(SCHEMA.read_text(encoding="utf-8"))
     n = len(win_probs)
+    if velodrome:
+        con.execute(
+            "INSERT INTO velodromes (jyo_cd, jyo_name, bank_length_m, straight_m,"
+            " share_nige, share_makuri, share_sashi)"
+            " VALUES ('21', '弥彦競輪場', 400.0, 63.1, 0.19, 0.30, 0.51)"
+        )
     con.execute(
         "INSERT INTO races (race_id, kaisai_date, jyo_cd, race_no, tosu) "
         "VALUES ('R1', DATE '2026-08-01', '21', 1, ?)",

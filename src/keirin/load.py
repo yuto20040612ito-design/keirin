@@ -19,6 +19,7 @@ from pathlib import Path
 import duckdb
 
 from . import rawstore
+from .keirinjp import parse_velodrome
 from .netkeirin import iter_odds_rows, parse_line_forecast
 
 log = logging.getLogger("keirin.load")
@@ -155,6 +156,13 @@ PAYOUT_COLUMNS = [
     "race_id", "bet_type", "combination", "payout_yen", "popularity", "updated_at",
 ]
 
+VELODROME_COLUMNS = [
+    "jyo_cd", "jyo_name", "bank_length_m", "straight_m", "bank_angle_deg",
+    "straight_angle_deg", "home_width_m", "back_width_m", "center_width_m",
+    "max_agari_sec", "compass_deg", "share_nige", "share_makuri", "share_sashi",
+    "updated_at",
+]
+
 _PRIMARY_KEYS = {
     "races": ["race_id"],
     "entries": ["race_id", "syaban"],
@@ -162,7 +170,28 @@ _PRIMARY_KEYS = {
     "odds_snapshots": ["race_id", "bet_type", "combination", "snapshot_at"],
     "results": ["race_id", "syaban"],
     "payouts": ["race_id", "bet_type", "combination"],
+    "velodromes": ["jyo_cd"],
 }
+
+
+def load_velodromes(con, root: Path) -> int:
+    """バンク諸元を投入する。静的データなので上書きでよい。"""
+    rows = []
+    for rec in rawstore.iter_class(root, "velodrome_html"):
+        markup = rec.get("payload")
+        if not isinstance(markup, str):
+            continue
+        d = parse_velodrome(markup)
+        if not d.get("jyo_cd"):
+            d["jyo_cd"] = (rec.get("params") or {}).get("jyo_cd")
+        if not d.get("jyo_cd"):
+            continue
+        d["updated_at"] = _iso(rec.get("fetched_at"))
+        rows.append(tuple(d.get(c) for c in VELODROME_COLUMNS))
+    if not rows:
+        return 0
+    bulk_upsert(con, "velodromes", rows, VELODROME_COLUMNS)
+    return len(rows)
 
 
 # ---------------------------------------------------------------------------
@@ -639,6 +668,7 @@ def main(argv: list[str] | None = None) -> int:
     con = duckdb.connect(str(args.db))
     init_db(con)
 
+    load_velodromes(con, args.data_root)
     load_races(con, args.data_root)
     load_entries(con, args.data_root)
     load_lines(con, args.data_root)
@@ -647,6 +677,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # 投入試行数ではなく実際のテーブル件数を出す(raw には同じレースが何度も入るため)
     for table in (
+        "velodromes",
         "races",
         "entries",
         "race_lines",

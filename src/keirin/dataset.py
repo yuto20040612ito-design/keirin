@@ -64,13 +64,23 @@ FORM_FEATURES = [
     "gear_ratio",         # ギヤ倍数
 ]
 
-FEATURE_NAMES = BASIC_FEATURES + LINE_FEATURES + FORM_FEATURES
+# バンク特性はレース内で一定なので、単体では softmax で消えて効かない。
+# 「そのバンクで誰が有利になるか」を表すには、必ず選手側の属性と掛ける。
+ENV_FEATURES = [
+    "head_x_straight",     # 先行役 × みなし直線。長い直線は差されやすい
+    "head_x_bank_nige",    # 先行役 × バンクの逃げ決着率
+    "nige_x_bank_nige",    # 選手の逃げ構成比 × バンクの逃げ決着率 (相性)
+    "sashi_x_bank_sashi",  # 選手の差し構成比 × バンクの差し決着率 (相性)
+]
+
+FEATURE_NAMES = BASIC_FEATURES + LINE_FEATURES + FORM_FEATURES + ENV_FEATURES
 
 # 比較する特徴量セット。同一レース集合で順に足していく。
 FEATURE_SETS = {
     "競走得点のみ": ["rating"],
     "+ライン・展開": BASIC_FEATURES + LINE_FEATURES,
-    "+脚質・実績": FEATURE_NAMES,
+    "+脚質・実績": BASIC_FEATURES + LINE_FEATURES + FORM_FEATURES,
+    "+バンク特性": FEATURE_NAMES,
 }
 
 RATING_ONLY = ["rating"]
@@ -112,10 +122,12 @@ SELECT e.race_id, r.kaisai_date, e.syaban, e.rating, e.kyu,
        e.win_nige, e.win_makuri, e.win_sashi, e.win_mark,
        e.cnt_1st, e.cnt_2nd, e.cnt_3rd, e.cnt_out,
        e.rate_win, e.rate_top3,
+       v.straight_m, v.share_nige AS bank_nige, v.share_sashi AS bank_sashi,
        CASE WHEN res.finish_pos = 1 THEN 1 ELSE 0 END AS won
 FROM entries e
 JOIN races r     ON r.race_id = e.race_id
 JOIN results res ON res.race_id = e.race_id AND res.syaban = e.syaban
+LEFT JOIN velodromes v ON v.jyo_cd = r.jyo_cd
 WHERE e.rating IS NOT NULL
 ORDER BY r.kaisai_date, e.race_id, e.syaban
 """
@@ -212,11 +224,36 @@ def _form_features(rows) -> np.ndarray | None:
     return np.array(out, dtype=float)
 
 
+def _env_features(rows, line_x: np.ndarray, form_x: np.ndarray) -> np.ndarray | None:
+    """バンク特性 × 選手属性の交互作用。
+
+    バンク諸元はレース内で一定なので、そのまま入れても条件付きロジットでは
+    消えてしまう。「このバンクでは誰が有利か」を表現するには選手側と掛ける。
+    """
+    straight = rows[0]["straight_m"]
+    bank_nige = rows[0]["bank_nige"]
+    bank_sashi = rows[0]["bank_sashi"]
+    if straight is None or bank_nige is None or bank_sashi is None:
+        return None
+
+    is_head = line_x[:, LINE_FEATURES.index("is_line_head")]
+    p_nige = form_x[:, FORM_FEATURES.index("share_nige")]
+    p_sashi = form_x[:, FORM_FEATURES.index("share_sashi")]
+
+    return np.column_stack([
+        is_head * float(straight),
+        is_head * float(bank_nige),
+        p_nige * float(bank_nige),
+        p_sashi * float(bank_sashi),
+    ])
+
+
 def build(
     con,
     require_market: bool = True,
     require_lines: bool = True,
     require_form: bool = True,
+    require_env: bool = True,
 ) -> list[RaceSample]:
     """レース単位のサンプル列を作る。時系列順に並ぶ。
 
@@ -232,7 +269,8 @@ def build(
         "kyakushitsu", "gear_ratio", "cnt_s", "cnt_b",
         "win_nige", "win_makuri", "win_sashi", "win_mark",
         "cnt_1st", "cnt_2nd", "cnt_3rd", "cnt_out",
-        "rate_win", "rate_top3", "won",
+        "rate_win", "rate_top3",
+        "straight_m", "bank_nige", "bank_sashi", "won",
     ]
     by_race: dict[str, list[dict]] = {}
     dates: dict[str, str] = {}
@@ -246,7 +284,7 @@ def build(
     samples: list[RaceSample] = []
     dropped = {
         "no_winner": 0, "no_market": 0, "incomplete_market": 0,
-        "no_lines": 0, "no_form": 0, "too_few": 0,
+        "no_lines": 0, "no_form": 0, "no_env": 0, "too_few": 0,
     }
 
     for race_id, entries in by_race.items():
@@ -286,8 +324,15 @@ def build(
                 continue
             form_x = np.zeros((n, len(FORM_FEATURES)))
 
+        env_x = _env_features(entries, line_x, form_x)
+        if env_x is None:
+            if require_env:
+                dropped["no_env"] += 1
+                continue
+            env_x = np.zeros((n, len(ENV_FEATURES)))
+
         x = np.column_stack(
-            [rating, rank, gap_top, is_s, syaban.astype(float), line_x, form_x]
+            [rating, rank, gap_top, is_s, syaban.astype(float), line_x, form_x, env_x]
         )
         assert x.shape[1] == len(FEATURE_NAMES), (x.shape, len(FEATURE_NAMES))
 

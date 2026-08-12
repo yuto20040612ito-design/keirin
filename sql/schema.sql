@@ -10,15 +10,26 @@
 -- マスタ
 -- ---------------------------------------------------------------------------
 
--- 競輪場マスタ。バンク諸元は keirin.jp の場データ(robots.txt 許可済)から補完する。
+-- 競輪場マスタ。バンク諸元は keirin.jp の場データ(robots.txt 許可済)から取る。
+-- 静的な情報なので収集は年1回で足りる。
 CREATE TABLE IF NOT EXISTS velodromes (
-    jyo_cd          VARCHAR PRIMARY KEY,   -- 場コード 2桁 ('21' = 弥彦)
-    jyo_name        VARCHAR NOT NULL,
-    bank_length_m   DOUBLE,                -- バンク周長 333 / 400 / 500
-    straight_m      DOUBLE,                -- みなし直線距離
-    bank_angle_deg  DOUBLE,                -- カント(最大カント角)
-    prefecture      VARCHAR,
-    updated_at      TIMESTAMP
+    jyo_cd              VARCHAR PRIMARY KEY,  -- 場コード 2桁 ('21' = 弥彦)
+    jyo_name            VARCHAR,
+    bank_length_m       DOUBLE,   -- バンク周長 333 / 400 / 500
+    straight_m          DOUBLE,   -- みなし直線距離。長いほど差しが決まりやすい
+    bank_angle_deg      DOUBLE,   -- センター部カント
+    straight_angle_deg  DOUBLE,   -- 直線部カント
+    home_width_m        DOUBLE,
+    back_width_m        DOUBLE,
+    center_width_m      DOUBLE,
+    max_agari_sec       DOUBLE,   -- 当該バンクの最高上がりタイム
+    compass_deg         DOUBLE,   -- バンクの方位。風向と組めば向かい風/追い風が出る
+    -- 当該バンクの1着決まり手構成 (逃げ/捲り/差しの3種で合計1)。
+    -- 「そのバンクでどう決まりやすいか」がそのまま入っている。
+    share_nige          DOUBLE,
+    share_makuri        DOUBLE,
+    share_sashi         DOUBLE,
+    updated_at          TIMESTAMP
 );
 
 -- 選手マスタ。属性は時点で変わるため、変わるものは entries 側にも持つ。
