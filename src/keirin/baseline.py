@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import unicodedata
 from pathlib import Path
 
 import duckdb
@@ -27,7 +28,7 @@ from scipy.optimize import minimize
 
 from .dataset import (
     FEATURE_NAMES,
-    RATING_ONLY,
+    FEATURE_SETS,
     RaceSample,
     build,
     select,
@@ -110,6 +111,12 @@ def top1_rate(samples, probs) -> float:
     return float(np.mean([int(np.argmax(p) == s.winner_idx) for s, p in zip(samples, probs)]))
 
 
+def _pad(s: str, width: int) -> str:
+    """全角を2桁として右詰めパディングする。表がずれると読めないので。"""
+    w = sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
+    return s + " " * max(0, width - w)
+
+
 def uniform_probs(samples: list[RaceSample]) -> list[np.ndarray]:
     return [np.full(s.n, 1.0 / s.n) for s in samples]
 
@@ -144,58 +151,75 @@ def fit_and_eval(samples, names, train_frac):
 
 
 def report(samples, train_frac: float) -> str:
-    base = fit_and_eval(samples, RATING_ONLY, train_frac)
-    full = fit_and_eval(samples, FEATURE_NAMES, train_frac)
+    """特徴量セットを順に足しながら、市場との差がどう縮むかを出す。
 
-    test = base["test"]
+    すべてのモデルが同一レース集合を見る。集合が変わると、改善したのか
+    レースが変わっただけなのか判別できなくなる。
+    """
+    fits = {name: fit_and_eval(samples, names, train_frac)
+            for name, names in FEATURE_SETS.items()}
+    first = next(iter(fits.values()))
+    test = first["test"]
     p_mkt = [s.p_market for s in test]
     p_unif = uniform_probs(test)
 
-    d_base, lo_b, hi_b = bootstrap_diff(test, base["probs"], p_mkt)
-    d_full, lo_f, hi_f = bootstrap_diff(test, full["probs"], p_mkt)
-    d_gain, lo_g, hi_g = bootstrap_diff(test, full["probs"], base["probs"])
+    def row(label: str, ll: float, top1: float) -> str:
+        return f"  {_pad(label, 18)} {ll:9.4f} {top1:6.1%}"
 
     out = [
         "",
-        f"  学習 {len(base['train'])} レース / 検証 {len(test)} レース",
+        f"  学習 {len(first['train'])} レース / 検証 {len(test)} レース",
         "",
-        f"  {'':22} {'log loss':>9} {'top1':>7}",
-        "  " + "-" * 40,
-        f"  {'一様分布':18} {log_loss(test, p_unif):9.4f} {top1_rate(test, p_unif):6.1%}",
-        f"  {'競走得点のみ':16} {base['ll']:9.4f} {base['top1']:6.1%}",
-        f"  {'+ライン・展開':15} {full['ll']:9.4f} {full['top1']:6.1%}",
-        f"  {'市場':20} {log_loss(test, p_mkt):9.4f} {top1_rate(test, p_mkt):6.1%}",
+        f"  {_pad('', 18)} {'log loss':>9} {'top1':>7}",
+        "  " + "-" * 37,
+        row("一様分布", log_loss(test, p_unif), top1_rate(test, p_unif)),
+    ]
+    for name, f in fits.items():
+        out.append(row(name, f["ll"], f["top1"]))
+    out += [
+        row("市場", log_loss(test, p_mkt), top1_rate(test, p_mkt)),
         "",
         "  市場との差 (正なら市場に負け):",
-        f"    競走得点のみ  {d_base:+.4f}  (95%CI {lo_b:+.4f} 〜 {hi_b:+.4f})",
-        f"    +ライン・展開 {d_full:+.4f}  (95%CI {lo_f:+.4f} 〜 {hi_f:+.4f})",
-        "",
-        f"  ライン特徴量による改善 {-d_gain:+.4f}"
-        f"  (95%CI {-hi_g:+.4f} 〜 {-lo_g:+.4f})",
-        "",
-        "  係数 (標準化後、絶対値順):",
     ]
 
-    order = np.argsort(-np.abs(full["beta"]))
-    for i in order:
+    diffs = {}
+    for name, f in fits.items():
+        d, lo, hi = bootstrap_diff(test, f["probs"], p_mkt)
+        diffs[name] = (d, lo, hi)
+        out.append(f"    {_pad(name, 16)} {d:+.4f}  (95%CI {lo:+.4f} 〜 {hi:+.4f})")
+
+    out += ["", "  1つ前のセットからの改善:"]
+    names = list(fits)
+    for prev, cur in zip(names, names[1:]):
+        d, lo, hi = bootstrap_diff(test, fits[cur]["probs"], fits[prev]["probs"])
+        # d は (cur - prev) の log loss 差。負なら改善なので符号を反転して出す。
+        verdict = (
+            "有意に改善" if hi < 0
+            else "有意に悪化" if lo > 0
+            else "有意でない"
+        )
+        out.append(
+            f"    {_pad(cur, 16)} {-d:+.4f}  (95%CI {-hi:+.4f} 〜 {-lo:+.4f})  {verdict}"
+        )
+
+    full = fits[names[-1]]
+    out += ["", "  係数 (標準化後、絶対値順):"]
+    for i in np.argsort(-np.abs(full["beta"])):
         out.append(f"    {FEATURE_NAMES[i]:20} {full['beta'][i]:+.4f}")
 
     out.append("")
-    if lo_g > 0:
-        out.append("  → ライン特徴量は有意な改善になっていない。")
-    elif hi_g < 0:
-        out.append("  → ライン特徴量は有意に改善している。")
-    else:
-        out.append("  → 改善は有意でない。サンプル不足か、効いていないかのどちらか。")
-
+    lo_f = diffs[names[-1]][1]
+    hi_f = diffs[names[-1]][2]
     if lo_f > 0:
-        out.append("  → それでもまだ市場には有意に負けている。想定どおり。")
+        out.append("  → まだ市場には有意に負けている。想定どおり。")
     elif hi_f < 0:
         out.append(
             "  → 市場に有意に勝っている。まずリークを疑うこと。\n"
             "     結果由来の値が特徴量に混ざっていないか、\n"
             "     学習と検証が時系列で分かれているかを確認する。"
         )
+    else:
+        out.append("  → 市場との差は有意でなくなった。サンプルを増やして再確認すること。")
 
     if len(test) < 500:
         out += [
@@ -211,14 +235,18 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--db", type=Path, default=Path("data/keirin.duckdb"))
     p.add_argument("--train-frac", type=float, default=0.7)
     p.add_argument(
-        "--no-lines", action="store_true",
-        help="ライン情報が無いレースも使う (競走得点のみの評価になる)",
+        "--no-lines", action="store_true", help="ライン情報が無いレースも使う",
+    )
+    p.add_argument(
+        "--no-form", action="store_true", help="出走表HTML(脚質等)が無いレースも使う",
     )
     args = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-7s %(message)s")
 
     con = duckdb.connect(str(args.db), read_only=True)
-    samples = build(con, require_lines=not args.no_lines)
+    samples = build(
+        con, require_lines=not args.no_lines, require_form=not args.no_form
+    )
     if len(samples) < 20:
         log.error("only %d usable races -- backfill more data first", len(samples))
         return 1

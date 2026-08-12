@@ -124,7 +124,15 @@ RACE_COLUMNS = [
 
 ENTRY_COLUMNS = [
     "race_id", "syaban", "wakuban", "player_id", "player_name", "player_kana",
-    "prefecture", "age", "graduate_period", "kyu", "han", "rating", "updated_at",
+    "prefecture", "age", "graduate_period", "kyu", "han", "rating",
+    # ここから下は出走表HTML由来。JSON API には無い。
+    "kyakushitsu", "gear_ratio",
+    "cnt_s", "cnt_h", "cnt_b",
+    "win_nige", "win_makuri", "win_sashi", "win_mark",
+    "cnt_1st", "cnt_2nd", "cnt_3rd", "cnt_out",
+    "rate_win", "rate_top2", "rate_top3",
+    "comment", "honshi_mark",
+    "updated_at",
 ]
 
 LINE_COLUMNS = [
@@ -227,7 +235,16 @@ def _hhmm_to_ts(kaisai_date: str, hhmm: str | None):
 
 
 def load_entries(con, root: Path) -> int:
-    rows = []
+    """出走表を投入する。
+
+    JSON API(AplRaceHorse)と出走表HTML(entry_html)を突き合わせてから1回で入れる。
+    片方ずつ upsert すると、後から入れたほうが相手の列を NULL で潰してしまう。
+
+    JSON からは 車番/枠番/級班/競走得点、
+    HTML からは 脚質/SHB/決まり手構成/ギヤ倍数/勝率 を取る。後者は JSON API に無い。
+    """
+    merged: dict[tuple[str, int], dict] = {}
+
     for rec in rawstore.iter_class(root, "AplRaceHorse"):
         fetched = _iso(rec.get("fetched_at"))
         for e in rec.get("payload") or []:
@@ -235,27 +252,154 @@ def load_entries(con, root: Path) -> int:
             syaban = _int(e.get("syaban"))
             if not rid or syaban is None:
                 continue
-            rows.append(
-                (
-                    rid,
-                    syaban,
-                    _int(e.get("wakuban")),
-                    None,  # player_id: HTML 側から補完
-                    e.get("name"),
-                    None,
-                    e.get("fuken"),
-                    _int(e.get("age")),
-                    _int(e.get("graduate")),
-                    e.get("kyu"),
-                    e.get("han"),
-                    _float(e.get("rating")),
-                    fetched,
-                )
-            )
-    if not rows:
+            merged[(rid, syaban)] = {
+                "race_id": rid,
+                "syaban": syaban,
+                "wakuban": _int(e.get("wakuban")),
+                "player_name": e.get("name"),
+                "prefecture": e.get("fuken"),
+                "age": _int(e.get("age")),
+                "graduate_period": _int(e.get("graduate")),
+                "kyu": e.get("kyu"),
+                "han": e.get("han"),
+                "rating": _float(e.get("rating")),
+                "updated_at": fetched,
+            }
+
+    for rec in rawstore.iter_class(root, "entry_html"):
+        rid = (rec.get("params") or {}).get("race_id")
+        markup = rec.get("payload")
+        if not rid or not isinstance(markup, str):
+            continue
+        fetched = _iso(rec.get("fetched_at"))
+        for syaban, extra in _parse_entry_html(markup).items():
+            row = merged.setdefault((rid, syaban), {
+                "race_id": rid, "syaban": syaban, "updated_at": fetched,
+            })
+            row.update(extra)
+
+    if not merged:
         return 0
+    rows = [tuple(r.get(c) for c in ENTRY_COLUMNS) for r in merged.values()]
     bulk_upsert(con, "entries", rows, ENTRY_COLUMNS)
     return len(rows)
+
+
+# 出走表テーブルのヘッダ名 -> entries の列名。
+# 固定インデックスではなくヘッダ照合にしてあるのは、列が増減しても静かに
+# ずれた値が入るより、その列が欠けるほうが安全なため。
+_ENTRY_HEADERS = {
+    "枠": "wakuban",
+    "車": "syaban",
+    "本紙": "honshi_mark",
+    "選手名": "_name",
+    "競走得点": "rating",
+    "脚質": "kyakushitsu",
+    "S": "cnt_s",
+    "H": "cnt_h",
+    "B": "cnt_b",
+    "逃げ": "win_nige",
+    "まくり": "win_makuri",
+    "差し": "win_sashi",
+    "マーク": "win_mark",
+    "1着": "cnt_1st",
+    "2着": "cnt_2nd",
+    "3着": "cnt_3rd",
+    "着外": "cnt_out",
+    "勝率": "rate_win",
+    "2連対率": "rate_top2",
+    "3連対率": "rate_top3",
+    "ギヤ倍数": "gear_ratio",
+    "選手コメント": "comment",
+}
+
+_INT_FIELDS = {
+    "cnt_s", "cnt_h", "cnt_b", "win_nige", "win_makuri", "win_sashi", "win_mark",
+    "cnt_1st", "cnt_2nd", "cnt_3rd", "cnt_out", "wakuban", "syaban",
+}
+_PCT_FIELDS = {"rate_win", "rate_top2", "rate_top3"}
+_FLOAT_FIELDS = {"rating", "gear_ratio"}
+
+
+def _norm_header(s: str) -> str:
+    """'マ｜ク' や '本 紙' のような表記ゆれを吸収する。"""
+    return re.sub(r"[\s｜|]", "", s).replace("マーク", "マーク")
+
+
+def _pct(v: str):
+    m = re.search(r"(\d+(?:\.\d+)?)\s*%", v or "")
+    return float(m.group(1)) / 100.0 if m else None
+
+
+def _parse_entry_html(markup: str) -> dict[int, dict]:
+    """出走表HTMLから車番ごとの追加情報を取り出す。"""
+    body = re.sub(r"<script.*?</script>|<style.*?</style>", "", markup, flags=re.S)
+    out: dict[int, dict] = {}
+
+    for tbl in re.findall(r"<table[^>]*>.*?</table>", body, re.S):
+        if "RaceCard_Table" not in tbl:
+            continue
+        rows = _rows_with_html(tbl)
+        if not rows:
+            continue
+
+        header = [_norm_header(c) for c in rows[0][0]]
+        # 'マ｜ク' は正規化すると 'マク' になるので合わせておく
+        colmap = {}
+        for i, h in enumerate(header):
+            key = {"マク": "マーク"}.get(h, h)
+            if key in _ENTRY_HEADERS:
+                colmap[_ENTRY_HEADERS[key]] = i
+        if "syaban" not in colmap or "kyakushitsu" not in colmap:
+            continue  # 出走表本体ではない
+
+        for cells, tr_html in rows[1:]:
+            syaban = _int(cells[colmap["syaban"]]) if colmap["syaban"] < len(cells) else None
+            if syaban is None:
+                continue
+            rec: dict = {}
+            for field, i in colmap.items():
+                if field == "syaban" or i >= len(cells):
+                    continue
+                raw = cells[i]
+                if field == "_name":
+                    parts = raw.split()
+                    if parts:
+                        rec["player_kana"] = parts[0]
+                elif field == "kyakushitsu":
+                    # '3 追' のように段階の数字が前に付く。記号だけ取る。
+                    m = re.search(r"[逃追両]", raw)
+                    rec["kyakushitsu"] = m.group(0) if m else None
+                elif field in _PCT_FIELDS:
+                    rec[field] = _pct(raw)
+                elif field in _INT_FIELDS:
+                    rec[field] = _int(raw)
+                elif field in _FLOAT_FIELDS:
+                    rec[field] = _float(raw)
+                else:
+                    rec[field] = raw or None
+
+            pid = re.search(r"db/profile/\?id=(\d+)", tr_html)
+            if pid:
+                rec["player_id"] = pid.group(1)
+            out[syaban] = rec
+        if out:
+            break
+    return out
+
+
+def _rows_with_html(markup: str) -> list[tuple[list[str], str]]:
+    """(セル文字列, その行の生HTML) の組。生HTMLは選手IDの抽出に要る。"""
+    out = []
+    for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", markup, re.S):
+        cells = []
+        for td in re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", tr, re.S):
+            txt = _TAG.sub(" ", td)
+            txt = html.unescape(txt).replace("\xa0", " ")
+            cells.append(re.sub(r"\s+", " ", txt).strip())
+        if cells:
+            out.append((cells, tr))
+    return out
 
 
 def load_lines(con, root: Path) -> int:

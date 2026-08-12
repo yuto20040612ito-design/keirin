@@ -19,7 +19,14 @@ from keirin.baseline import (
     top1_rate,
     uniform_probs,
 )
-from keirin.dataset import RaceSample, build, select, time_split
+from keirin.dataset import (
+    FEATURE_NAMES,
+    FEATURE_SETS,
+    RaceSample,
+    build,
+    select,
+    time_split,
+)
 
 SCHEMA = Path(__file__).resolve().parents[1] / "sql" / "schema.sql"
 
@@ -60,8 +67,22 @@ def _make_db(win_probs=(0.5, 0.3, 0.2), winner_syaban=1, lines=([1, 2], [3])):
     )
     for s in range(1, n + 1):
         con.execute(
-            "INSERT INTO entries (race_id, syaban, rating) VALUES ('R1', ?, ?)",
-            [s, 80.0 + s],
+            "INSERT INTO entries (race_id, syaban, rating, kyakushitsu, gear_ratio,"
+            " cnt_s, cnt_b, win_nige, win_makuri, win_sashi, win_mark,"
+            " cnt_1st, cnt_2nd, cnt_3rd, cnt_out, rate_win, rate_top3)"
+            " VALUES ('R1', ?, ?, ?, 3.92, ?, ?, ?, 0, ?, 0, ?, 2, 2, ?, ?, ?)",
+            [
+                s, 80.0 + s,
+                ["逃", "追", "両"][(s - 1) % 3],
+                s,                      # cnt_s
+                10 - s,                 # cnt_b
+                4 if s == 1 else 0,     # win_nige
+                0 if s == 1 else 4,     # win_sashi
+                s,                      # cnt_1st
+                20 - s,                 # cnt_out  -> starts = s + 2 + 2 + (20-s) = 24
+                0.1 * s,                # rate_win
+                0.3 * s,                # rate_top3
+            ],
         )
         con.execute(
             "INSERT INTO results (race_id, syaban, finish_pos) VALUES ('R1', ?, ?)",
@@ -255,3 +276,60 @@ class TestFeatureSelection:
         con = _make_db()
         x = select(build(con), ["rating_gap_top"])[0].x[:, 0]
         assert list(x) == [2.0, 1.0, 0.0]
+
+
+class TestFormFeatures:
+    """出走表HTML由来の特徴量。脚質はライン位置の代理ではなく実物。"""
+
+    def _x(self, names):
+        con = _make_db()
+        return select(build(con), names)[0].x
+
+    def test_kyakushitsu_dummies(self):
+        # _make_db は車1=逃, 車2=追, 車3=両
+        x = self._x(["is_nige", "is_ryo"])
+        assert list(x[:, 0]) == [1.0, 0.0, 0.0]
+        assert list(x[:, 1]) == [0.0, 0.0, 1.0]
+
+    def test_back_count_is_normalised_by_starts(self):
+        """生の回数だと『どう勝つ選手か』ではなく『何走したか』を見てしまう。"""
+        # cnt_b = 10 - s, starts = 24
+        x = self._x(["b_per_start"])
+        assert x[0, 0] == pytest.approx(9 / 24)
+        assert x[2, 0] == pytest.approx(7 / 24)
+
+    def test_kimarite_is_a_share_not_a_count(self):
+        # 車1: win_nige=4, 他0 -> 逃げ構成比 1.0
+        # 車2: win_sashi=4, 他0 -> 差し構成比 1.0
+        x = self._x(["share_nige", "share_sashi"])
+        assert x[0, 0] == pytest.approx(1.0)
+        assert x[0, 1] == pytest.approx(0.0)
+        assert x[1, 0] == pytest.approx(0.0)
+        assert x[1, 1] == pytest.approx(1.0)
+
+    def test_rates_pass_through(self):
+        x = self._x(["rate_win", "rate_top3"])
+        assert x[0, 0] == pytest.approx(0.1)
+        assert x[2, 1] == pytest.approx(0.9)
+
+    def test_races_without_form_data_are_dropped_when_required(self):
+        con = _make_db()
+        con.execute("UPDATE entries SET kyakushitsu = NULL")
+        assert build(con, require_form=True) == []
+        assert len(build(con, require_form=False)) == 1
+
+    def test_zero_kimarite_does_not_divide_by_zero(self):
+        """まだ勝ったことがない選手でも落ちないこと。"""
+        con = _make_db()
+        con.execute("UPDATE entries SET win_nige=0, win_makuri=0, win_sashi=0, win_mark=0")
+        x = select(build(con), ["share_nige"])[0].x
+        assert list(x[:, 0]) == [0.0, 0.0, 0.0]
+
+
+class TestFeatureSets:
+    def test_sets_are_nested_and_cover_all_features(self):
+        """順に足していく比較なので、前のセットは次のセットに含まれていること。"""
+        sets = list(FEATURE_SETS.values())
+        for prev, cur in zip(sets, sets[1:]):
+            assert set(prev) <= set(cur)
+        assert set(sets[-1]) == set(FEATURE_NAMES)

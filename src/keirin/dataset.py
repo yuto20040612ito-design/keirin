@@ -32,12 +32,15 @@ log = logging.getLogger("keirin.dataset")
 # 2車単。(1着,2着) の順序対を全通り覆うので周辺化に使える。
 EXACTA = 6
 
-FEATURE_NAMES = [
+BASIC_FEATURES = [
     "rating",             # 競走得点
     "rating_rank",        # レース内順位 (0=最上位 .. 1=最下位)
     "rating_gap_top",     # トップとの得点差
     "is_s_class",         # S級か
     "syaban",             # 車番 (内が有利とされる)
+]
+
+LINE_FEATURES = [
     "line_size",          # 所属ラインの人数
     "line_pos",           # ライン内位置 (1=先頭)
     "is_line_head",       # ライン先頭 ≒ 先行役
@@ -47,7 +50,29 @@ FEATURE_NAMES = [
     "head_x_nlines",      # 先行役 × ライン数。先行争いの激しさが先行役に効く分
 ]
 
-# ライン情報が要らない特徴量。Phase 2 のベースラインはこれだけで作る。
+# 出走表HTML由来。JSON API には無い。脚質はライン内位置の代理ではなく実物。
+FORM_FEATURES = [
+    "is_nige",            # 脚質=逃 (基準は追)
+    "is_ryo",             # 脚質=両
+    "b_per_start",        # バック回数/出走。実績としての先行力
+    "s_per_start",        # S回数/出走
+    "rate_win",           # 勝率
+    "rate_top3",          # 3連対率
+    "share_nige",         # 決まり手構成比: 逃げ
+    "share_makuri",       # 決まり手構成比: まくり
+    "share_sashi",        # 決まり手構成比: 差し
+    "gear_ratio",         # ギヤ倍数
+]
+
+FEATURE_NAMES = BASIC_FEATURES + LINE_FEATURES + FORM_FEATURES
+
+# 比較する特徴量セット。同一レース集合で順に足していく。
+FEATURE_SETS = {
+    "競走得点のみ": ["rating"],
+    "+ライン・展開": BASIC_FEATURES + LINE_FEATURES,
+    "+脚質・実績": FEATURE_NAMES,
+}
+
 RATING_ONLY = ["rating"]
 
 
@@ -83,6 +108,10 @@ GROUP BY 1, 2
 
 BASE_SQL = """
 SELECT e.race_id, r.kaisai_date, e.syaban, e.rating, e.kyu,
+       e.kyakushitsu, e.gear_ratio, e.cnt_s, e.cnt_b,
+       e.win_nige, e.win_makuri, e.win_sashi, e.win_mark,
+       e.cnt_1st, e.cnt_2nd, e.cnt_3rd, e.cnt_out,
+       e.rate_win, e.rate_top3,
        CASE WHEN res.finish_pos = 1 THEN 1 ELSE 0 END AS won
 FROM entries e
 JOIN races r     ON r.race_id = e.race_id
@@ -146,7 +175,49 @@ def _line_features(syaban, rating, line_map) -> np.ndarray | None:
     ])
 
 
-def build(con, require_market: bool = True, require_lines: bool = True) -> list[RaceSample]:
+def _form_features(rows) -> np.ndarray | None:
+    """出走表HTML由来の特徴量。1人でも欠けていれば None。
+
+    決まり手は回数そのものではなく構成比にする。ベテランほど回数が積み上がるので、
+    生の回数だと「どう勝つ選手か」ではなく「何走したか」を見てしまう。
+    """
+    out = []
+    for r in rows:
+        kyaku = r["kyakushitsu"]
+        if kyaku is None or r["gear_ratio"] is None:
+            return None
+
+        starts = sum(
+            (r[k] or 0) for k in ("cnt_1st", "cnt_2nd", "cnt_3rd", "cnt_out")
+        )
+        if starts <= 0:
+            return None
+        kimarite = sum(
+            (r[k] or 0) for k in ("win_nige", "win_makuri", "win_sashi", "win_mark")
+        )
+        denom = kimarite if kimarite > 0 else 1
+
+        out.append([
+            1.0 if kyaku == "逃" else 0.0,
+            1.0 if kyaku == "両" else 0.0,
+            (r["cnt_b"] or 0) / starts,
+            (r["cnt_s"] or 0) / starts,
+            r["rate_win"] or 0.0,
+            r["rate_top3"] or 0.0,
+            (r["win_nige"] or 0) / denom,
+            (r["win_makuri"] or 0) / denom,
+            (r["win_sashi"] or 0) / denom,
+            r["gear_ratio"],
+        ])
+    return np.array(out, dtype=float)
+
+
+def build(
+    con,
+    require_market: bool = True,
+    require_lines: bool = True,
+    require_form: bool = True,
+) -> list[RaceSample]:
     """レース単位のサンプル列を作る。時系列順に並ぶ。
 
     require_lines=True のとき、ライン情報が揃わないレースは落とす。
@@ -156,26 +227,36 @@ def build(con, require_market: bool = True, require_lines: bool = True) -> list[
     market, combos = _fetch_market(con)
     lines = _fetch_lines(con)
 
-    by_race: dict[str, list[tuple]] = {}
+    cols = [
+        "race_id", "kaisai_date", "syaban", "rating", "kyu",
+        "kyakushitsu", "gear_ratio", "cnt_s", "cnt_b",
+        "win_nige", "win_makuri", "win_sashi", "win_mark",
+        "cnt_1st", "cnt_2nd", "cnt_3rd", "cnt_out",
+        "rate_win", "rate_top3", "won",
+    ]
+    by_race: dict[str, list[dict]] = {}
     dates: dict[str, str] = {}
-    for race_id, kaisai_date, syaban, rating, kyu, won in con.execute(BASE_SQL).fetchall():
-        by_race.setdefault(race_id, []).append(
-            (int(syaban), float(rating), str(kyu or ""), int(won))
-        )
-        dates[race_id] = str(kaisai_date)
+    for row in con.execute(BASE_SQL).fetchall():
+        r = dict(zip(cols, row))
+        r["syaban"] = int(r["syaban"])
+        r["rating"] = float(r["rating"])
+        by_race.setdefault(r["race_id"], []).append(r)
+        dates[r["race_id"]] = str(r["kaisai_date"])
 
     samples: list[RaceSample] = []
     dropped = {
         "no_winner": 0, "no_market": 0, "incomplete_market": 0,
-        "no_lines": 0, "too_few": 0,
+        "no_lines": 0, "no_form": 0, "too_few": 0,
     }
 
     for race_id, entries in by_race.items():
-        entries.sort()
-        syaban = np.array([e[0] for e in entries], dtype=int)
-        rating = np.array([e[1] for e in entries], dtype=float)
-        is_s = np.array([1.0 if e[2].strip() in ("Ｓ", "S") else 0.0 for e in entries])
-        won = np.array([e[3] for e in entries], dtype=int)
+        entries.sort(key=lambda e: e["syaban"])
+        syaban = np.array([e["syaban"] for e in entries], dtype=int)
+        rating = np.array([e["rating"] for e in entries], dtype=float)
+        is_s = np.array(
+            [1.0 if str(e["kyu"] or "").strip() in ("Ｓ", "S") else 0.0 for e in entries]
+        )
+        won = np.array([e["won"] for e in entries], dtype=int)
         n = len(syaban)
 
         if n < 2:
@@ -196,9 +277,18 @@ def build(con, require_market: bool = True, require_lines: bool = True) -> list[
             if require_lines:
                 dropped["no_lines"] += 1
                 continue
-            line_x = np.zeros((n, 7))
+            line_x = np.zeros((n, len(LINE_FEATURES)))
 
-        x = np.column_stack([rating, rank, gap_top, is_s, syaban.astype(float), line_x])
+        form_x = _form_features(entries)
+        if form_x is None:
+            if require_form:
+                dropped["no_form"] += 1
+                continue
+            form_x = np.zeros((n, len(FORM_FEATURES)))
+
+        x = np.column_stack(
+            [rating, rank, gap_top, is_s, syaban.astype(float), line_x, form_x]
+        )
         assert x.shape[1] == len(FEATURE_NAMES), (x.shape, len(FEATURE_NAMES))
 
         p_market = None

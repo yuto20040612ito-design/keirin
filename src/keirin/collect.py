@@ -390,7 +390,13 @@ def collect_results(
 # 過去レースで取得できるもの。オッズは確定オッズが1点だけ返る。
 # 締切前の推移は遡れないが、確定オッズは市場の最終評価そのものなので
 # Phase 2 のベースライン比較には十分使える。
-BACKFILL_KINDS = ("AplRaceHorse", "AplNarabiYoso", "AplRaceOdds", "result_html")
+BACKFILL_KINDS = (
+    "AplRaceHorse",    # 車番/枠番/級班/競走得点 (JSON)
+    "AplNarabiYoso",   # ライン構成 (JSON)
+    "AplRaceOdds",     # 確定オッズ (JSON)
+    "entry_html",      # 脚質/SHB/決まり手構成/ギヤ倍数 (HTML。JSON API に無い)
+    "result_html",     # 着順/決まり手/払戻 (HTML)
+)
 
 
 def _fetch_one(
@@ -399,6 +405,8 @@ def _fetch_one(
     try:
         if kind == "result_html":
             payload = client.get_html("race/result/", race_id=race.race_id)
+        elif kind == "entry_html":
+            payload = client.get_html("race/entry/", race_id=race.race_id)
         elif kind == "AplRaceHorse":
             payload = client.entries(race.race_id)
         elif kind == "AplNarabiYoso":
