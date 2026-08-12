@@ -28,15 +28,17 @@ import logging
 import sys
 import time
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 from . import keirinjp, rawstore
 from .manifest import Manifest
 from .netkeirin import NetkeirinClient, NetkeirinError, parse_line_forecast
 
-JST = ZoneInfo("Asia/Tokyo")
+# 日本標準時は年間を通じて UTC+9 で、サマータイムが無い。
+# 固定オフセットで完全に正しく、zoneinfo (Python 3.9+) に依存せずに済む。
+# 共用レンタルサーバーは Python が古いことがあるので、依存は少ないほどよい。
+JST = timezone(timedelta(hours=9))
 DEFAULT_DATA_ROOT = Path("data")
 
 # 締切の何秒前にオッズを取るか。締切直前ほど密に刻む。
@@ -353,6 +355,136 @@ def watch(
         collector.collect_odds(race, datetime.now(JST))
 
 
+# ---------------------------------------------------------------------------
+# cron 方式 (共用レンタルサーバー向け)
+# ---------------------------------------------------------------------------
+#
+# 共用サーバーでは常駐プロセスが禁止・強制終了される。1分ごとに cron で叩き、
+# 「前回実行から今までの間に予定時刻を過ぎたレース」だけ取って終了する。
+#
+# 状態は last_run の時刻ひとつだけ。プロセスが落ちても次の起動で続きから拾える。
+# ただし cron が止まればその間の予定は丸ごと飛ぶので、status での確認は必須。
+
+
+def _state_dir(root: Path) -> Path:
+    d = Path(root) / "state"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _read_last_run(root: Path, now: datetime) -> datetime:
+    path = _state_dir(root) / "last_run.txt"
+    if path.exists():
+        try:
+            return datetime.fromisoformat(path.read_text().strip())
+        except ValueError:
+            pass
+    # 初回は直近2分ぶんだけ見る。過去に遡って一気に取りにいかない。
+    return now - timedelta(seconds=120)
+
+
+def _write_last_run(root: Path, now: datetime) -> None:
+    (_state_dir(root) / "last_run.txt").write_text(now.isoformat())
+
+
+def _cached_schedule(
+    client: NetkeirinClient, root: Path, date_str: str, now: datetime,
+    max_age_sec: int = 1800,
+) -> list[Race]:
+    """その日のレース一覧。cron は毎分走るので必ずキャッシュする。
+
+    毎回 API を叩くと1日1440リクエストになり、取りたいオッズの邪魔にしかならない。
+    """
+    cache = _state_dir(root) / f"schedule_{date_str}.json"
+    if cache.exists():
+        try:
+            doc = json.loads(cache.read_text())
+            # 鮮度はファイルの mtime ではなく中身の取得時刻で見る。
+            # mtime はコピーやリストアで簡単に変わってしまう。
+            fetched = datetime.fromisoformat(doc["fetched_at"])
+            raw = doc["races"] if (now - fetched).total_seconds() < max_age_sec else None
+        except (json.JSONDecodeError, KeyError, ValueError, TypeError):
+            raw = None
+        if raw is not None:
+            try:
+                return [
+                    Race(
+                        race_id=r["race_id"], kaisai_date=r["kaisai_date"],
+                        jyo_cd=r["jyo_cd"], jyo=r["jyo"], race_no=r["race_no"],
+                        race_name=r["race_name"], tosu=r["tosu"],
+                        close_at=datetime.fromisoformat(r["close_at"]) if r["close_at"] else None,
+                        start_at=datetime.fromisoformat(r["start_at"]) if r["start_at"] else None,
+                    )
+                    for r in raw
+                ]
+            except (KeyError, ValueError, TypeError):
+                pass  # 壊れていたら取り直す
+
+    try:
+        calendar = fetch_calendar(client, root, int(date_str[:4]))
+        races = load_day(client, root, date_str, calendar)
+    except NetkeirinError as exc:
+        log.error("schedule fetch failed: %s", exc)
+        return []
+
+    cache.write_text(json.dumps({
+        "fetched_at": now.isoformat(),
+        "races": [
+            {
+                "race_id": r.race_id, "kaisai_date": r.kaisai_date, "jyo_cd": r.jyo_cd,
+                "jyo": r.jyo, "race_no": r.race_no, "race_name": r.race_name,
+                "tosu": r.tosu,
+                "close_at": r.close_at.isoformat() if r.close_at else None,
+                "start_at": r.start_at.isoformat() if r.start_at else None,
+            }
+            for r in races
+        ],
+    }, ensure_ascii=False))
+    return races
+
+
+def run_once(client: NetkeirinClient, root: Path) -> int:
+    """cron から1分ごとに呼ばれる想定。予定を過ぎたぶんだけ取って終了する。"""
+    now = datetime.now(JST)
+    last_run = _read_last_run(root, now)
+
+    # ミッドナイト競輪は締切が翌日 00:xx になる。早朝は前日ぶんも見る。
+    dates = [now.strftime("%Y%m%d")]
+    if now.hour < 2:
+        dates.append((now - timedelta(days=1)).strftime("%Y%m%d"))
+
+    races: list[Race] = []
+    for date_str in dates:
+        races.extend(_cached_schedule(client, root, date_str, now))
+    if not races:
+        _write_last_run(root, now)
+        log.info("no races scheduled")
+        return 0
+
+    collector = OddsCollector(client, root)
+    man = Manifest(root)
+    # 静的情報は取得済みを索引から復元する(プロセスをまたぐので毎回リセットされる)
+    collector._static_done = set(man.done("AplNarabiYoso"))
+
+    n_odds = 0
+    for race in races:
+        if race.close_at is None:
+            continue
+        # 前回実行から今までの間に予定時刻を過ぎていれば取る
+        if any(last_run < t <= now for t in _due_times(race)):
+            if collector.collect_odds(race, now):
+                n_odds += 1
+        # 締切1時間前を切ったらライン・出走を一度だけ
+        secs = (race.close_at - now).total_seconds()
+        if 0 < secs <= max(POLL_OFFSETS_SEC) and not man.has("AplNarabiYoso", race.race_id):
+            collector.collect_static(race)
+            man.mark("AplNarabiYoso", race.race_id)
+
+    _write_last_run(root, now)
+    log.info("once: %d races known, %d odds snapshots saved", len(races), n_odds)
+    return 0
+
+
 def _secs_to_midnight(now: datetime) -> float:
     nxt = (now + timedelta(days=1)).replace(hour=0, minute=0, second=5, microsecond=0)
     return max(30.0, (nxt - now).total_seconds())
@@ -561,7 +693,7 @@ def print_status(client: NetkeirinClient, root: Path, days: int) -> int:
     seen = 0
     if base.exists():
         for part in sorted(base.glob("dt=*/part.jsonl.gz"), reverse=True)[:days]:
-            date_str = part.parent.name.removeprefix("dt=")
+            date_str = part.parent.name.split("=", 1)[-1]
             races, snaps = set(), 0
             for rec in rawstore.read(part):
                 rid = (rec.get("params") or {}).get("race_id")
@@ -609,8 +741,13 @@ def main(argv: list[str] | None = None) -> int:
     pl = sub.add_parser("plan", help="指定日のレース一覧と締切時刻を表示")
     pl.add_argument("--date", required=True, help="YYYYMMDD")
 
-    w = sub.add_parser("watch", help="オッズ収集ループ (Phase 0 本体)")
+    w = sub.add_parser("watch", help="オッズ収集ループ (常駐。VPS/自宅サーバー向け)")
     w.add_argument("--date", help="YYYYMMDD。省略時は当日を追い続ける")
+
+    sub.add_parser(
+        "once",
+        help="1回だけ収集して終了 (cron 向け。共用レンタルサーバーはこちら)",
+    )
 
     rs = sub.add_parser("results", help="確定結果ページをバックフィル")
     rs.add_argument("--date", required=True, help="YYYYMMDD")
@@ -653,6 +790,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{r.race_id}  {close}  {r.jyo:6} {r.race_no:2}R  {r.tosu}車  {r.race_name}")
         print(f"\n{len(races)} races on {args.date}")
         return 0
+
+    if args.cmd == "once":
+        return run_once(client, root)
 
     if args.cmd == "watch":
         try:

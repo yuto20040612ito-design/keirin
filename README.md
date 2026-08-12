@@ -130,6 +130,16 @@ python -m keirin.collect status
 
 ### 常駐させる
 
+**共用レンタルサーバー（エックスサーバー等）を使う場合は
+[`docs/SETUP_XSERVER.md`](docs/SETUP_XSERVER.md) を見ること。**
+常駐が禁止されているため `watch` は使えず、cron から `once` を毎分呼ぶ方式になる。
+
+```bash
+python -m keirin.collect once   # 1回ぶん取って終了。cron 向け
+```
+
+以下は VPS・自宅サーバーなど常駐できる環境の場合。
+
 `watch` は日付が変わると当日の開催を自動で読み直すので、起動しっぱなしでよい。
 systemd ユニットを [`deploy/keirin-collect.service`](deploy/keirin-collect.service)
 に置いてある（`WorkingDirectory` と `User` は環境に合わせて書き換えること）。

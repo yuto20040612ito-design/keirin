@@ -7,7 +7,7 @@
 
 from datetime import datetime
 
-from keirin.collect import JST, Race, _fix_midnight_rollover, _parse_hhmm
+from keirin.collect import JST, NetkeirinError, Race, _fix_midnight_rollover, _parse_hhmm
 from keirin.netkeirin import iter_odds_rows, parse_line_forecast
 
 
@@ -261,3 +261,141 @@ class TestBackfillDateMarker:
         b = "20260810|" + "+".join(sorted(["result_html", "AplRaceOdds"]))
         m.mark("dates", a)
         assert m.has("dates", b)
+
+
+# ---------------------------------------------------------------------------
+# cron 方式 (共用レンタルサーバー向け)
+# ---------------------------------------------------------------------------
+
+from datetime import timedelta  # noqa: E402
+
+from keirin.collect import (  # noqa: E402
+    POLL_OFFSETS_SEC,
+    _cached_schedule,
+    _due_times,
+    _read_last_run,
+    _write_last_run,
+)
+
+
+class TestJst:
+    def test_jst_is_a_fixed_nine_hour_offset(self):
+        """日本標準時はサマータイムが無いので固定オフセットで完全に正しい。
+
+        zoneinfo (Python 3.9+) に依存しないことで、Python が古い共用サーバーでも動く。
+        """
+        assert JST.utcoffset(None) == timedelta(hours=9)
+
+    def test_summer_and_winter_have_the_same_offset(self):
+        jan = datetime(2026, 1, 15, 12, 0, tzinfo=JST)
+        aug = datetime(2026, 8, 15, 12, 0, tzinfo=JST)
+        assert jan.utcoffset() == aug.utcoffset()
+
+
+class TestLastRunState:
+    def test_first_run_only_looks_back_briefly(self, tmp_path):
+        """初回に過去を全部遡って一気に取りにいかないこと。"""
+        now = datetime(2026, 8, 13, 12, 0, tzinfo=JST)
+        got = _read_last_run(tmp_path, now)
+        assert timedelta(seconds=0) < (now - got) <= timedelta(minutes=5)
+
+    def test_round_trips(self, tmp_path):
+        now = datetime(2026, 8, 13, 12, 0, tzinfo=JST)
+        _write_last_run(tmp_path, now)
+        assert _read_last_run(tmp_path, now + timedelta(minutes=5)) == now
+
+    def test_corrupt_state_falls_back_instead_of_crashing(self, tmp_path):
+        (tmp_path / "state").mkdir()
+        (tmp_path / "state" / "last_run.txt").write_text("not a timestamp")
+        now = datetime(2026, 8, 13, 12, 0, tzinfo=JST)
+        assert _read_last_run(tmp_path, now) < now
+
+
+class TestDueWindow:
+    """cron は毎分走る。前回実行から今までに予定時刻を過ぎたものだけ取る。"""
+
+    def _race(self, close_hhmm="12:00"):
+        return _race_for_cron(close_hhmm)
+
+    def test_scheduled_times_are_before_the_deadline(self):
+        race = self._race()
+        times = _due_times(race)
+        # 最後の1つは締切直後の確定オッズ狙い
+        assert sum(1 for t in times if t < race.close_at) == len(POLL_OFFSETS_SEC)
+        assert max(times) > race.close_at
+
+    def test_a_minute_window_catches_the_scheduled_time(self):
+        race = self._race()
+        target = race.close_at - timedelta(seconds=300)   # 5分前は予定に入っている
+        prev = target - timedelta(seconds=30)
+        now = target + timedelta(seconds=30)
+        assert any(prev < t <= now for t in _due_times(race))
+
+    def test_a_window_with_nothing_scheduled_fires_nothing(self):
+        race = self._race()
+        prev = race.close_at - timedelta(hours=5)
+        now = prev + timedelta(seconds=60)
+        assert not any(prev < t <= now for t in _due_times(race))
+
+    def test_no_close_time_means_nothing_scheduled(self):
+        assert _due_times(_race_for_cron("")) == []
+
+
+def _race_for_cron(close_hhmm):
+    return Race(
+        race_id="202608134801", kaisai_date="20260813", jyo_cd="48", jyo="四日市",
+        race_no=1, race_name="", tosu=7,
+        close_at=_parse_hhmm("20260813", close_hhmm), start_at=None,
+    )
+
+
+class TestScheduleCache:
+    """cron は毎分走るので、レース一覧を毎回取りにいってはいけない。"""
+
+    def test_cache_is_used_without_touching_the_network(self, tmp_path):
+        now = datetime(2026, 8, 13, 12, 0, tzinfo=JST)
+        state = tmp_path / "state"
+        state.mkdir()
+        (state / "schedule_20260813.json").write_text(
+            '{"fetched_at":"2026-08-13T11:55:00+09:00","races":'
+            '[{"race_id":"202608134801","kaisai_date":"20260813","jyo_cd":"48",'
+            '"jyo":"四日市","race_no":1,"race_name":"","tosu":7,'
+            '"close_at":"2026-08-13T12:30:00+09:00","start_at":null}]}',
+            encoding="utf-8",
+        )
+
+        class Boom:
+            def __getattr__(self, name):
+                raise AssertionError("キャッシュがあるのに通信した")
+
+        races = _cached_schedule(Boom(), tmp_path, "20260813", now)
+        assert len(races) == 1
+        assert races[0].close_at == datetime(2026, 8, 13, 12, 30, tzinfo=JST)
+
+    def test_stale_cache_is_refetched(self, tmp_path):
+        """開催情報は当日でも更新される(欠車など)ので、古いまま使い続けない。"""
+        now = datetime(2026, 8, 13, 12, 0, tzinfo=JST)
+        state = tmp_path / "state"
+        state.mkdir()
+        (state / "schedule_20260813.json").write_text(
+            '{"fetched_at":"2026-08-13T02:00:00+09:00","races":[]}', encoding="utf-8"
+        )
+
+        class Failing:
+            def calendar(self, year):
+                raise NetkeirinError("offline")
+
+        # 10時間前のキャッシュは使わず取り直しにいく(通信に失敗するので空が返る)
+        assert _cached_schedule(Failing(), tmp_path, "20260813", now) == []
+
+    def test_corrupt_cache_is_refetched_not_crashed(self, tmp_path):
+        now = datetime(2026, 8, 13, 12, 0, tzinfo=JST)
+        state = tmp_path / "state"
+        state.mkdir()
+        (state / "schedule_20260813.json").write_text("{ broken", encoding="utf-8")
+
+        class Failing:
+            def calendar(self, year):
+                raise NetkeirinError("offline")
+
+        assert _cached_schedule(Failing(), tmp_path, "20260813", now) == []

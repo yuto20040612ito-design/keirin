@@ -2,7 +2,10 @@
 name = "keirin"
 version = "0.1.0"
 description = "競輪の予測・期待値評価のためのデータベースと収集基盤"
-requires-python = ">=3.11"
+# 収集(keirin.collect)は共用レンタルサーバーでも動かせるよう依存を絞ってある。
+# 分析側(duckdb/numpy)はもっと新しい Python を要求するので、
+# 収集サーバーと分析マシンは分けてよい。
+requires-python = ">=3.8"
 # 収集 (keirin.collect) は標準ライブラリのみで動く。
 # 何ヶ月も回り続けるプロセスなので、依存で壊れるリスクを持ち込まない。
 dependencies = []
