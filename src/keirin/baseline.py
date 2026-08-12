@@ -29,6 +29,7 @@ from scipy.optimize import minimize
 from .dataset import (
     FEATURE_NAMES,
     FEATURE_SETS,
+    MARKET_SETS,
     RaceSample,
     build,
     select,
@@ -221,6 +222,8 @@ def report(samples, train_frac: float) -> str:
     else:
         out.append("  → 市場との差は有意でなくなった。サンプルを増やして再確認すること。")
 
+    out += _edge_report(samples, train_frac, test)
+
     if len(test) < 500:
         out += [
             "",
@@ -228,6 +231,61 @@ def report(samples, train_frac: float) -> str:
             "     判断には最低でも数千レース規模のバックフィルが要る。",
         ]
     return "\n".join(out)
+
+
+def _edge_report(samples, train_frac: float, test_ref) -> list[str]:
+    """市場を出発点にして、自前の特徴量が上乗せできるかを測る。
+
+    市場に負けていることと、市場が知らない情報を持っていないことは別問題。
+    賭けて勝てるかどうかを決めるのは後者なので、こちらが本命の検定になる。
+
+    market_only は log(市場確率) だけを入れたモデル。係数が1なら市場そのもの。
+    そこに自前の特徴量を足して有意に改善するなら、市場が織り込んでいない情報を
+    持っていることになる。それがエッジの源泉。
+    """
+    fits = {name: fit_and_eval(samples, names, train_frac)
+            for name, names in MARKET_SETS.items()}
+    names = list(fits)
+    mkt, both = fits[names[0]], fits[names[1]]
+    test = mkt["test"]
+
+    d, lo, hi = bootstrap_diff(test, both["probs"], mkt["probs"])
+    out = [
+        "",
+        "  " + "=" * 58,
+        "  エッジの検定: 市場に自前の特徴量を足して改善するか",
+        "  " + "=" * 58,
+        "",
+        f"  {_pad('市場のみ', 18)} {mkt['ll']:9.4f}",
+        f"  {_pad('市場+自前特徴', 18)} {both['ll']:9.4f}",
+        "",
+        f"  上乗せ分 {-d:+.4f}  (95%CI {-hi:+.4f} 〜 {-lo:+.4f})",
+        "",
+    ]
+
+    if hi < 0:
+        out += [
+            "  → 市場が知らない情報を持っている。エッジの候補あり。",
+            "     ただし控除率25%を超える大きさかは別問題。backtest で確認すること。",
+        ]
+    elif lo > 0:
+        out.append("  → 足すと悪化する。自前の特徴量は市場の劣化コピーになっている。")
+    else:
+        out += [
+            "  → 上乗せは有意でない。市場が既に織り込んでいる情報しか持っていない。",
+            "     この状態で賭けても、控除率のぶんだけ負ける。",
+        ]
+
+    # 市場係数が1から離れていれば、市場自体に系統的な歪みがある
+    beta_mkt = both["beta"][FEATURE_NAMES.index("mkt_logit")]
+    out += [
+        "",
+        f"  市場のみモデルの係数 = {mkt['beta'][0]:+.4f}"
+        "   (標準化後なので1にはならない。符号と大きさだけ見る)",
+        f"  併用モデルでの市場係数 = {beta_mkt:+.4f}",
+    ]
+    _ = test_ref
+    return out
 
 
 def main(argv: list[str] | None = None) -> int:

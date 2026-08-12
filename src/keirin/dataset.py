@@ -73,14 +73,27 @@ ENV_FEATURES = [
     "sashi_x_bank_sashi",  # 選手の差し構成比 × バンクの差し決着率 (相性)
 ]
 
-FEATURE_NAMES = BASIC_FEATURES + LINE_FEATURES + FORM_FEATURES + ENV_FEATURES
+# 市場のインプライド確率の対数。係数1でこれだけを入れると市場を完全に再現する。
+# したがって「市場 + 自前特徴」の改善分が、市場が知らない情報の量そのものになる。
+MARKET_FEATURES = ["mkt_logit"]
+
+OWN_FEATURES = BASIC_FEATURES + LINE_FEATURES + FORM_FEATURES + ENV_FEATURES
+FEATURE_NAMES = OWN_FEATURES + MARKET_FEATURES
 
 # 比較する特徴量セット。同一レース集合で順に足していく。
 FEATURE_SETS = {
     "競走得点のみ": ["rating"],
     "+ライン・展開": BASIC_FEATURES + LINE_FEATURES,
     "+脚質・実績": BASIC_FEATURES + LINE_FEATURES + FORM_FEATURES,
-    "+バンク特性": FEATURE_NAMES,
+    "+バンク特性": OWN_FEATURES,
+}
+
+# エッジの有無を直接測るための比較。
+# 市場に負けていることと、市場が知らない情報を持っていないことは別問題。
+# 知りたいのは「市場を出発点にして、自前の特徴量が上乗せできるか」。
+MARKET_SETS = {
+    "市場のみ": MARKET_FEATURES,
+    "市場+自前特徴": FEATURE_NAMES,
 }
 
 RATING_ONLY = ["rating"]
@@ -331,10 +344,10 @@ def build(
                 continue
             env_x = np.zeros((n, len(ENV_FEATURES)))
 
-        x = np.column_stack(
+        x_own = np.column_stack(
             [rating, rank, gap_top, is_s, syaban.astype(float), line_x, form_x, env_x]
         )
-        assert x.shape[1] == len(FEATURE_NAMES), (x.shape, len(FEATURE_NAMES))
+        assert x_own.shape[1] == len(OWN_FEATURES), (x_own.shape, len(OWN_FEATURES))
 
         p_market = None
         mk = market.get(race_id)
@@ -351,6 +364,15 @@ def build(
             if mk is None:
                 dropped["no_market"] += 1
             continue
+
+        # 市場特徴量は log を取る。softmax は exp を掛けるので、
+        # 係数1の log p は市場そのものを再現する。
+        mkt_logit = (
+            np.zeros(n) if p_market is None
+            else np.log(np.clip(p_market, 1e-12, None))
+        )
+        x = np.column_stack([x_own, mkt_logit])
+        assert x.shape[1] == len(FEATURE_NAMES), (x.shape, len(FEATURE_NAMES))
 
         samples.append(
             RaceSample(

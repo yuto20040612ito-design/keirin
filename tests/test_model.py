@@ -22,6 +22,8 @@ from keirin.baseline import (
 from keirin.dataset import (
     FEATURE_NAMES,
     FEATURE_SETS,
+    MARKET_SETS,
+    OWN_FEATURES,
     RaceSample,
     build,
     select,
@@ -334,9 +336,27 @@ class TestFormFeatures:
 
 
 class TestFeatureSets:
-    def test_sets_are_nested_and_cover_all_features(self):
+    def test_sets_are_nested_and_cover_all_own_features(self):
         """順に足していく比較なので、前のセットは次のセットに含まれていること。"""
         sets = list(FEATURE_SETS.values())
         for prev, cur in zip(sets, sets[1:]):
             assert set(prev) <= set(cur)
-        assert set(sets[-1]) == set(FEATURE_NAMES)
+        assert set(sets[-1]) == set(OWN_FEATURES)
+
+    def test_market_feature_is_kept_out_of_the_own_feature_sets(self):
+        """市場特徴量を混ぜると「市場を超えたか」の比較にならなくなる。"""
+        for names in FEATURE_SETS.values():
+            assert "mkt_logit" not in names
+
+    def test_market_sets_add_own_features_on_top_of_the_market(self):
+        """エッジの検定は、市場を出発点にして上乗せできるかを見るもの。"""
+        base, both = MARKET_SETS["市場のみ"], MARKET_SETS["市場+自前特徴"]
+        assert base == ["mkt_logit"]
+        assert set(base) < set(both)
+        assert set(both) == set(FEATURE_NAMES)
+
+    def test_market_feature_reproduces_the_market(self):
+        """log(市場確率) を係数1で softmax に通すと市場そのものに戻ること。"""
+        con = _make_db(win_probs=(0.5, 0.3, 0.2))
+        s = select(build(con), ["mkt_logit"])[0]
+        np.testing.assert_allclose(_softmax(s.x[:, 0]), [0.5, 0.3, 0.2], atol=1e-9)
