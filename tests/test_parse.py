@@ -238,3 +238,26 @@ class TestManifest:
         m.mark("AplRaceOdds", "R1")
         m.mark("AplRaceOdds", "R1")
         assert (tmp_path / "manifest" / "AplRaceOdds.txt").read_text().count("R1") == 1
+
+
+class TestBackfillDateMarker:
+    """--kinds を絞った日を、後から別の kinds で埋め直せること。
+
+    完了マーカーを日付だけで持つと、結果だけ集めた日に後から出走表を足せなくなる
+    (実際にこれで出走表を取りこぼした)。
+    """
+
+    def test_date_marker_is_scoped_to_kinds(self, tmp_path):
+        m = Manifest(tmp_path)
+        odds_only = "20260810|" + "+".join(sorted(["AplRaceOdds"]))
+        with_entries = "20260810|" + "+".join(sorted(["AplRaceOdds", "AplRaceHorse"]))
+        m.mark("dates", odds_only)
+        assert m.has("dates", odds_only)
+        assert not m.has("dates", with_entries)
+
+    def test_kind_order_does_not_change_the_marker(self, tmp_path):
+        m = Manifest(tmp_path)
+        a = "20260810|" + "+".join(sorted(["AplRaceOdds", "result_html"]))
+        b = "20260810|" + "+".join(sorted(["result_html", "AplRaceOdds"]))
+        m.mark("dates", a)
+        assert m.has("dates", b)

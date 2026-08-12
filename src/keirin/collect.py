@@ -455,8 +455,11 @@ def backfill(
         if not jyo_for_date(calendars[year], date_str):
             continue  # 非開催日
 
-        if man.has("dates", date_str):
-            log.info("%s: already complete, skipping", date_str)
+        # 完了マーカーは kinds ごとに分ける。日付だけで持つと、--kinds を絞って
+        # 収集した日を後から別の kinds で埋め直せなくなる。
+        date_key = f"{date_str}|{'+'.join(sorted(kinds))}"
+        if man.has("dates", date_key):
+            log.info("%s: already complete for %s, skipping", date_str, ",".join(kinds))
             continue
 
         races = load_day(client, root, date_str, calendars[year])
@@ -473,7 +476,7 @@ def backfill(
                     man.mark(kind, race.race_id)
                     day_done += 1
                     total_done += 1
-        man.mark("dates", date_str)
+        man.mark("dates", date_key)
         log.info(
             "%s: %d races, %d fetched (total %d fetched / %d skipped)",
             date_str,
