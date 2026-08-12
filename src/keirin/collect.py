@@ -496,6 +496,102 @@ def backfill(
 
 
 # ---------------------------------------------------------------------------
+# 稼働確認
+# ---------------------------------------------------------------------------
+
+
+def _last_fetch(root: Path, api_class: str) -> datetime | None:
+    """そのクラスで最後に何かを取れた時刻。
+
+    パーティションは開催日で切ってあるので、日付の新しい順に見ると誤る。
+    バックフィルは過去日のパーティションに「今」書き込むため、
+    日付順の最後が最新の書き込みとは限らない。
+    実際に最後に書かれたファイル(mtime が最大)を見る。
+    """
+    base = root / "raw" / api_class
+    if not base.exists():
+        return None
+    parts = list(base.glob("dt=*/part.jsonl.gz"))
+    if not parts:
+        return None
+    newest = max(parts, key=lambda p: p.stat().st_mtime)
+    last = None
+    for rec in rawstore.read(newest):
+        ts = rec.get("fetched_at")
+        if ts:
+            last = ts
+    if last is None:
+        return None
+    try:
+        return datetime.fromisoformat(last).astimezone(JST)
+    except ValueError:
+        return None
+
+
+def print_status(client: NetkeirinClient, root: Path, days: int) -> int:
+    """収集が生きているかを、取れたデータそのものから確認する。
+
+    プロセスの生死ではなくデータの新しさを見る。プロセスが生きていても
+    取れていなければ意味がなく、逆に落ちても再起動されていれば問題ない。
+    セッションやマシンの再起動で静かに止まるのが一番怖い失敗なので、
+    「最後にオッズが取れたのはいつか」を一目で出す。
+    """
+    now = datetime.now(JST)
+    print(f"\n  現在時刻 {now:%Y-%m-%d %H:%M} (JST)\n")
+
+    print("  最後に取得できた時刻:")
+    stale = False
+    for api_class, label, warn_after_h in (
+        ("AplRaceOdds", "オッズ", 24),
+        ("AplNarabiYoso", "ライン", 24),
+        ("AplRace", "レース一覧", 48),
+    ):
+        last = _last_fetch(root, api_class)
+        if last is None:
+            print(f"    {label:12} まだ1件も無い")
+            stale = True
+            continue
+        age_h = (now - last).total_seconds() / 3600
+        mark = "  ← 古い" if age_h > warn_after_h else ""
+        stale = stale or age_h > warn_after_h
+        print(f"    {label:12} {last:%Y-%m-%d %H:%M}  ({age_h:.1f}時間前){mark}")
+
+    print("\n  日別のオッズ収集レース数 (開催日ごと):")
+    base = root / "raw" / "AplRaceOdds"
+    seen = 0
+    if base.exists():
+        for part in sorted(base.glob("dt=*/part.jsonl.gz"), reverse=True)[:days]:
+            date_str = part.parent.name.removeprefix("dt=")
+            races, snaps = set(), 0
+            for rec in rawstore.read(part):
+                rid = (rec.get("params") or {}).get("race_id")
+                if rid:
+                    races.add(rid)
+                    snaps += 1
+            print(f"    {date_str}  {len(races):4d} レース / {snaps:6d} スナップショット")
+            seen += 1
+    if not seen:
+        print("    まだ無い")
+
+    try:
+        cal = fetch_calendar(client, root, now.year)
+        today = now.strftime("%Y%m%d")
+        venues = jyo_for_date(cal, today)
+        print(f"\n  本日 {today} の開催: {len(venues)} 場")
+        if venues:
+            print("    " + ", ".join(name for _, name in venues))
+    except NetkeirinError as exc:
+        print(f"\n  開催カレンダーの取得に失敗: {exc}")
+
+    if stale:
+        print("\n  → 収集が止まっている可能性がある。watch が動いているか確認すること。")
+        print("     systemd なら: systemctl status keirin-collect")
+    else:
+        print("\n  → 収集は動いているように見える。")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -532,6 +628,9 @@ def main(argv: list[str] | None = None) -> int:
     rb.add_argument("--kinds", default=",".join(BACKFILL_KINDS))
 
     sub.add_parser("velodromes", help="公式からバンク諸元を取得 (年1回で足りる)")
+
+    st = sub.add_parser("status", help="収集が生きているか確認する")
+    st.add_argument("--days", type=int, default=7, help="遡って確認する日数")
 
     args = p.parse_args(argv)
     logging.basicConfig(
@@ -577,6 +676,9 @@ def main(argv: list[str] | None = None) -> int:
         except KeyboardInterrupt:
             log.info("interrupted -- rerun the same command to resume")
         return 0
+
+    if args.cmd == "status":
+        return print_status(client, root, args.days)
 
     if args.cmd == "velodromes":
         codes = keirinjp.list_velodrome_codes(client)

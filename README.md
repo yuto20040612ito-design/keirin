@@ -123,19 +123,54 @@ python -m keirin.backtest --db data/keirin.duckdb
 
 # 市場が歪んでいる場所を探す (多重比較の補正つき)
 python -m keirin.segments --db data/keirin.duckdb
+
+# 収集が止まっていないか確認する
+python -m keirin.collect status
 ```
 
 ### 常駐させる
 
-`watch` は日付が変わると当日の開催を自動で読み直すので、
-起動しっぱなしにしておけばよい。systemd ユニットを
-[`deploy/keirin-collect.service`](deploy/keirin-collect.service) に置いてある。
+`watch` は日付が変わると当日の開催を自動で読み直すので、起動しっぱなしでよい。
+systemd ユニットを [`deploy/keirin-collect.service`](deploy/keirin-collect.service)
+に置いてある（`WorkingDirectory` と `User` は環境に合わせて書き換えること）。
 
 ```bash
 sudo cp deploy/keirin-collect.service /etc/systemd/system/
+sudo systemctl daemon-reload
 sudo systemctl enable --now keirin-collect
 journalctl -u keirin-collect -f
 ```
+
+`Restart=always` にしてある。締切前オッズは取り逃すと永久に手に入らないので、
+どんな終わり方をしても必ず戻すのが正しい。
+
+### 止まっていないか確認する
+
+**これが運用でいちばん重要。** 収集は静かに止まる。
+プロセスが落ちても誰も教えてくれないし、落ちた日のオッズは二度と取れない。
+
+```bash
+python -m keirin.collect status
+```
+
+プロセスの生死ではなく**取れたデータの新しさ**を見る。
+プロセスが生きていても取れていなければ意味がなく、
+逆に落ちても再起動されていれば問題ないため。
+
+```
+  最後に取得できた時刻:
+    オッズ          2026-08-13 03:11  (1.2時間前)
+    ライン          2026-08-13 03:11  (1.2時間前)
+    レース一覧      2026-08-13 03:11  (1.2時間前)
+
+  日別のオッズ収集レース数 (開催日ごと):
+    20260813    67 レース /    892 スナップショット
+
+  → 収集は動いているように見える。
+```
+
+24時間以上オッズが取れていなければ警告を出す。
+cron で毎朝叩いてメールさせるなり、監視に繋ぐなりしておくとよい。
 
 ### バックフィルの所要時間
 
