@@ -19,7 +19,7 @@ from keirin.baseline import (
     top1_rate,
     uniform_probs,
 )
-from keirin.dataset import RaceSample, build, time_split
+from keirin.dataset import RaceSample, build, select, time_split
 
 SCHEMA = Path(__file__).resolve().parents[1] / "sql" / "schema.sql"
 
@@ -37,7 +37,19 @@ def _exacta_probs(win_probs):
     return out
 
 
-def _make_db(win_probs=(0.5, 0.3, 0.2), winner_syaban=1):
+def _add_lines(con, lines):
+    """lines は [[車番...], ...]。'0' 区切りを展開した後の形。"""
+    for line_no, members in enumerate(lines, start=1):
+        for pos, syaban in enumerate(members, start=1):
+            con.execute(
+                "INSERT INTO race_lines (race_id, line_no, position, syaban,"
+                " line_size, is_solo, source, fetched_at)"
+                " VALUES ('R1', ?, ?, ?, ?, ?, 'AplNarabiYoso', NULL)",
+                [line_no, pos, syaban, len(members), len(members) == 1],
+            )
+
+
+def _make_db(win_probs=(0.5, 0.3, 0.2), winner_syaban=1, lines=([1, 2], [3])):
     con = duckdb.connect(":memory:")
     con.execute(SCHEMA.read_text(encoding="utf-8"))
     n = len(win_probs)
@@ -63,6 +75,8 @@ def _make_db(win_probs=(0.5, 0.3, 0.2), winner_syaban=1):
             " TIMESTAMP '2026-08-01 10:00:00', 0)",
             [f"{i:02d}{j:02d}", TAKEOUT / p],
         )
+    if lines:
+        _add_lines(con, lines)
     return con
 
 
@@ -173,3 +187,71 @@ class TestTimeSplit:
         ]
         train, test = time_split(samples, 0.7)
         assert max(s.kaisai_date for s in train) < min(s.kaisai_date for s in test)
+
+
+class TestLineFeatures:
+    """ライン内位置は競輪では脚質の代理変数になる(先頭=先行、番手=追込)。"""
+
+    def _x(self, lines, names):
+        con = _make_db(lines=lines)
+        s = build(con)[0]
+        return select([s], names)[0].x
+
+    def test_line_head_is_flagged(self):
+        # ライン 1-2 と単騎 3。車番順に並ぶので行は [1, 2, 3]
+        x = self._x([[1, 2], [3]], ["is_line_head"])
+        assert list(x[:, 0]) == [1.0, 0.0, 1.0]  # 単騎も自ラインの先頭
+
+    def test_solo_is_flagged(self):
+        x = self._x([[1, 2], [3]], ["is_solo"])
+        assert list(x[:, 0]) == [0.0, 0.0, 1.0]
+
+    def test_line_size_and_position(self):
+        x = self._x([[1, 2], [3]], ["line_size", "line_pos"])
+        assert list(x[:, 0]) == [2.0, 2.0, 1.0]
+        assert list(x[:, 1]) == [1.0, 2.0, 1.0]
+
+    def test_line_head_rating_is_shared_across_the_line(self):
+        """番手の選手にとっては「誰の後ろに付くか」が効く。"""
+        # rating は _make_db で 81, 82, 83 (車番+80)
+        x = self._x([[1, 2], [3]], ["line_head_rating"])
+        assert x[0, 0] == x[1, 0] == 81.0   # ライン先頭は車1
+        assert x[2, 0] == 83.0              # 単騎は自分自身
+
+    def test_line_rating_mean(self):
+        x = self._x([[1, 2], [3]], ["line_rating_mean"])
+        assert x[0, 0] == x[1, 0] == pytest.approx(81.5)
+        assert x[2, 0] == pytest.approx(83.0)
+
+    def test_head_interaction_counts_lines(self):
+        """レース内で一定の値は softmax で消えるので、交互作用にしてある。"""
+        x = self._x([[1], [2], [3]], ["head_x_nlines"])
+        assert list(x[:, 0]) == [3.0, 3.0, 3.0]
+
+    def test_races_without_line_data_are_dropped_when_required(self):
+        """特徴量セットを変えて比較するとき、レース集合が変わってはいけない。"""
+        con = _make_db(lines=None)
+        assert build(con, require_lines=True) == []
+        assert len(build(con, require_lines=False)) == 1
+
+
+class TestFeatureSelection:
+    def test_select_preserves_race_set_and_labels(self):
+        con = _make_db()
+        full = build(con)
+        sub = select(full, ["rating"])
+        assert len(sub) == len(full)
+        assert sub[0].winner_idx == full[0].winner_idx
+        assert sub[0].x.shape[1] == 1
+
+    def test_rating_rank_is_normalised(self):
+        con = _make_db()
+        x = select(build(con), ["rating_rank"])[0].x[:, 0]
+        # rating は 81,82,83 なので車3が最上位
+        assert x[2] == pytest.approx(0.0)
+        assert x[0] == pytest.approx(1.0)
+
+    def test_gap_to_top(self):
+        con = _make_db()
+        x = select(build(con), ["rating_gap_top"])[0].x[:, 0]
+        assert list(x) == [2.0, 1.0, 0.0]
