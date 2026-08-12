@@ -63,6 +63,100 @@ def init_db(con: duckdb.DuckDBPyConnection) -> None:
     con.execute(SCHEMA_PATH.read_text(encoding="utf-8"))
 
 
+def bulk_upsert(con, table: str, rows: list[tuple], columns: list[str]) -> int:
+    """まとめて INSERT OR REPLACE する。
+
+    executemany は DuckDB では1行ずつの実行になり、主キー付きテーブルに数十万行
+    入れると実用にならない(オッズは1レース約700組あるのですぐそうなる)。
+    Arrow 経由で一括投入すると桁で速くなる。
+
+    pyarrow が無い環境では executemany に落ちる。収集(Phase 0)は標準ライブラリ
+    だけで動く必要があるが、投入は analysis extra を入れる前提なので許容する。
+    """
+    if not rows:
+        return 0
+    placeholders = ",".join("?" * len(columns))
+    col_list = ",".join(columns)
+    try:
+        import pyarrow as pa
+    except ImportError:
+        con.executemany(
+            f"INSERT OR REPLACE INTO {table} ({col_list}) VALUES ({placeholders})", rows
+        )
+        return len(rows)
+
+    try:
+        arrays = [pa.array(col) for col in zip(*rows)]
+        tbl = pa.Table.from_arrays(arrays, names=columns)
+    except (pa.ArrowInvalid, pa.ArrowTypeError) as exc:
+        # 型推論に失敗したら遅い経路で確実に入れる。取りこぼすよりは遅いほうがまし。
+        log.warning("arrow conversion failed for %s (%s); falling back", table, exc)
+        con.executemany(
+            f"INSERT OR REPLACE INTO {table} ({col_list}) VALUES ({placeholders})", rows
+        )
+        return len(rows)
+
+    con.register("_bulk", tbl)
+    try:
+        # 同一バッチ内に主キー重複があると ON CONFLICT が二重更新でこける。
+        # raw は追記のみで同じレースが何度も入るため、ここで先に畳んでおく。
+        pk = _PRIMARY_KEYS.get(table)
+        src = "_bulk"
+        if pk:
+            keys = ",".join(pk)
+            src = (
+                f"(SELECT * EXCLUDE (_rn) FROM (SELECT *, "
+                f"ROW_NUMBER() OVER (PARTITION BY {keys} ORDER BY 1) AS _rn "
+                f"FROM _bulk) WHERE _rn = 1)"
+            )
+        con.execute(f"INSERT OR REPLACE INTO {table} ({col_list}) SELECT {col_list} FROM {src}")
+    finally:
+        con.unregister("_bulk")
+    return len(rows)
+
+
+RACE_COLUMNS = [
+    "race_id", "kaisai_date", "jyo_cd", "race_no", "race_name", "jyoken", "grade",
+    "tosu", "kyori_m", "laps", "start_at", "close_at", "nichiji", "last_day_flg",
+    "tenko", "wind_dir", "wind_speed_ms", "temperature_c", "race_status",
+    "is_girls", "is_midnight", "source", "updated_at",
+]
+
+ENTRY_COLUMNS = [
+    "race_id", "syaban", "wakuban", "player_id", "player_name", "player_kana",
+    "prefecture", "age", "graduate_period", "kyu", "han", "rating", "updated_at",
+]
+
+LINE_COLUMNS = [
+    "race_id", "line_no", "position", "syaban", "line_size", "is_solo",
+    "source", "fetched_at",
+]
+
+ODDS_COLUMNS = [
+    "race_id", "bet_type", "combination", "snapshot_at", "official_dt",
+    "is_official", "odds_low", "odds_high", "popularity", "fetched_at",
+    "secs_to_close",
+]
+
+RESULT_COLUMNS = [
+    "race_id", "syaban", "finish_pos", "finish_status", "margin",
+    "last_lap_time", "kimarite", "got_s", "got_b", "updated_at",
+]
+
+PAYOUT_COLUMNS = [
+    "race_id", "bet_type", "combination", "payout_yen", "popularity", "updated_at",
+]
+
+_PRIMARY_KEYS = {
+    "races": ["race_id"],
+    "entries": ["race_id", "syaban"],
+    "race_lines": ["race_id", "source", "syaban"],
+    "odds_snapshots": ["race_id", "bet_type", "combination", "snapshot_at"],
+    "results": ["race_id", "syaban"],
+    "payouts": ["race_id", "bet_type", "combination"],
+}
+
+
 # ---------------------------------------------------------------------------
 # races
 # ---------------------------------------------------------------------------
@@ -108,11 +202,7 @@ def load_races(con, root: Path) -> int:
                 )
     if not rows:
         return 0
-    con.executemany(
-        """INSERT OR REPLACE INTO races VALUES
-           (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        rows,
-    )
+    bulk_upsert(con, "races", rows, RACE_COLUMNS)
     # ミッドナイトは締切が概ね 20:30 以降。時刻から判定する。
     con.execute(
         "UPDATE races SET is_midnight = (close_at IS NOT NULL AND hour(close_at) >= 20)"
@@ -164,13 +254,7 @@ def load_entries(con, root: Path) -> int:
             )
     if not rows:
         return 0
-    con.executemany(
-        """INSERT OR REPLACE INTO entries
-           (race_id, syaban, wakuban, player_id, player_name, player_kana,
-            prefecture, age, graduate_period, kyu, han, rating, updated_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        rows,
-    )
+    bulk_upsert(con, "entries", rows, ENTRY_COLUMNS)
     return len(rows)
 
 
@@ -195,9 +279,7 @@ def load_lines(con, root: Path) -> int:
                     )
     if not rows:
         return 0
-    con.executemany(
-        "INSERT OR REPLACE INTO race_lines VALUES (?,?,?,?,?,?,?,?)", rows
-    )
+    bulk_upsert(con, "race_lines", rows, LINE_COLUMNS)
     return len(rows)
 
 
@@ -249,9 +331,7 @@ def load_odds(con, root: Path) -> int:
             )
     if not rows:
         return 0
-    con.executemany(
-        "INSERT OR REPLACE INTO odds_snapshots VALUES (?,?,?,?,?,?,?,?,?,?,?)", rows
-    )
+    bulk_upsert(con, "odds_snapshots", rows, ODDS_COLUMNS)
     return len(rows)
 
 
@@ -310,13 +390,9 @@ def load_results(con, root: Path) -> tuple[int, int]:
                 pay_rows.extend(_parse_payout_table(tbl, rid, fetched))
 
     if res_rows:
-        con.executemany(
-            "INSERT OR REPLACE INTO results VALUES (?,?,?,?,?,?,?,?,?,?)", res_rows
-        )
+        bulk_upsert(con, "results", res_rows, RESULT_COLUMNS)
     if pay_rows:
-        con.executemany(
-            "INSERT OR REPLACE INTO payouts VALUES (?,?,?,?,?,?)", pay_rows
-        )
+        bulk_upsert(con, "payouts", pay_rows, PAYOUT_COLUMNS)
     return len(res_rows), len(pay_rows)
 
 
