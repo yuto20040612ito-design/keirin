@@ -94,13 +94,20 @@ jobs:
             exit 0
           fi
           git commit -m "data: collect odds $(TZ=Asia/Tokyo date '+%F %H:%M') JST"
-          # 別枠のジョブが先にコミットしている場合に備えて rebase してから push
+          # 素直に push して、弾かれたときだけ追いつく。
+          # checkout は既定で浅いクローンなので、rebase の前に履歴を足す
+          # (足りないと merge-base が見つからず rebase が失敗する)。
+          # データが増えると全履歴の取得は重くなるため、必要なぶんだけ深くする。
           for i in 1 2 3; do
-            git pull --rebase --autostash origin "${GITHUB_REF_NAME}" && \
-              git push origin "HEAD:${GITHUB_REF_NAME}" && exit 0
-            echo "push に失敗。${i}回目、少し待って再試行"
+            if git push origin "HEAD:${GITHUB_REF_NAME}"; then
+              exit 0
+            fi
+            echo "push が弾かれた。追いついて再試行 (${i}回目)"
+            git fetch --depth=50 origin "${GITHUB_REF_NAME}" || git fetch --unshallow origin "${GITHUB_REF_NAME}" || true
+            git rebase "origin/${GITHUB_REF_NAME}" || { git rebase --abort; true; }
             sleep $((i * 5))
           done
+          echo "push できなかった。データはこのランのログにしか残っていない"
           exit 1
 
       - name: 収集状況を表示する
