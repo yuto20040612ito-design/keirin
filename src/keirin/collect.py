@@ -297,8 +297,14 @@ def watch(
     root: Path,
     target_date: str | None = None,
     lookahead_sec: int = max(POLL_OFFSETS_SEC),
+    until: datetime | None = None,
 ) -> None:
-    """収集ループ。日付が変わったらその日の開催を読み直す。"""
+    """収集ループ。日付が変わったらその日の開催を読み直す。
+
+    until を渡すとその時刻で終了する。GitHub Actions のように1ジョブの実行時間に
+    上限(6時間)がある環境で、時間切れで強制終了される前に自分から抜けるため。
+    強制終了されると、それまでに集めたデータをコミットする機会が無くなる。
+    """
     collector = OddsCollector(client, root)
     calendar_year: int | None = None
     calendar: list[dict] = []
@@ -308,6 +314,9 @@ def watch(
 
     while True:
         now = datetime.now(JST)
+        if until is not None and now >= until:
+            log.info("reached --until %s; exiting cleanly", until.strftime("%H:%M"))
+            return
         today = target_date or now.strftime("%Y%m%d")
 
         if calendar_year != now.year:
@@ -339,7 +348,10 @@ def watch(
 
         if not pending:
             # 次の日付境界まで待つ(最大10分刻みで起き直す)
-            time.sleep(min(600, _secs_to_midnight(now)))
+            nap = min(600, _secs_to_midnight(now))
+            if until is not None:
+                nap = min(nap, max(1.0, (until - datetime.now(JST)).total_seconds()))
+            time.sleep(nap)
             if target_date:
                 log.info("target date finished; exiting")
                 return
@@ -347,6 +359,9 @@ def watch(
 
         due_at, race = pending[0]
         wait = (due_at - datetime.now(JST)).total_seconds()
+        if until is not None:
+            # 終了時刻を跨いで眠らない。跨ぐと時間切れで強制終了される。
+            wait = min(wait, (until - datetime.now(JST)).total_seconds())
         if wait > 0:
             time.sleep(min(wait, 600))
             if (due_at - datetime.now(JST)).total_seconds() > 1:
@@ -743,6 +758,10 @@ def main(argv: list[str] | None = None) -> int:
 
     w = sub.add_parser("watch", help="オッズ収集ループ (常駐。VPS/自宅サーバー向け)")
     w.add_argument("--date", help="YYYYMMDD。省略時は当日を追い続ける")
+    w.add_argument(
+        "--until",
+        help="HH:MM (JST)。この時刻で終了する。実行時間に上限がある環境用",
+    )
 
     sub.add_parser(
         "once",
@@ -795,8 +814,17 @@ def main(argv: list[str] | None = None) -> int:
         return run_once(client, root)
 
     if args.cmd == "watch":
+        until = None
+        if args.until:
+            now = datetime.now(JST)
+            hh, mm = (int(x) for x in args.until.split(":")[:2])
+            until = now.replace(hour=hh % 24, minute=mm, second=0, microsecond=0)
+            until += timedelta(days=hh // 24)
+            if until <= now:  # 既に過ぎていれば翌日のその時刻
+                until += timedelta(days=1)
+            log.info("will stop at %s", until.isoformat())
         try:
-            watch(client, root, target_date=args.date)
+            watch(client, root, target_date=args.date, until=until)
         except KeyboardInterrupt:
             log.info("interrupted")
         return 0

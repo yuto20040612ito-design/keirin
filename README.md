@@ -128,6 +128,14 @@ python -m keirin.segments --db data/keirin.duckdb
 python -m keirin.collect status
 ```
 
+### どこで動かすか
+
+| 環境 | 手順 | 備考 |
+|---|---|---|
+| **スマホだけ（GitHub Actions）** | [`docs/SETUP_PHONE.md`](docs/SETUP_PHONE.md) | PC・サーバー不要。要 public 化 |
+| 共用レンタルサーバー | [`docs/SETUP_XSERVER.md`](docs/SETUP_XSERVER.md) | cron から `once` |
+| VPS・自宅サーバー | 下記 systemd | `watch` を常駐 |
+
 ### 常駐させる
 
 **共用レンタルサーバー（エックスサーバー等）を使う場合は

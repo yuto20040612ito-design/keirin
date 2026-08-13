@@ -1,0 +1,109 @@
+name: collect odds
+
+# 注意: このワークフローはデフォルトブランチ(main)に入るまで動かない。
+# schedule はデフォルトブランチの内容しか実行しないという GitHub の仕様による。
+# 作業ブランチに置いてある間、誤って課金枠を消費することはない。
+
+# 締切前オッズは取り逃すと永久に手に入らない。GitHub Actions で集めて、
+# そのままこのリポジトリにコミットする。サーバーもPCも要らない。
+#
+# 設計の理由:
+#
+# * cron を細かく回す方式は使えない。schedule は最短5分間隔で、しかも
+#   「高負荷時は遅延する(毎時0分付近が特に混む)」と公式に明記されている。
+#   締切15秒前を狙う用途に、外部からの起床タイミングは信用できない。
+#
+# * 代わりに1回あたり長く走らせ、時刻の制御はプロセス内部の watch に任せる。
+#   1ジョブの上限は6時間なので、1日を3枠に割って隙間なく覆う。
+#
+# * --until で自分から終了する。時間切れで強制終了されると、それまでに
+#   集めたデータをコミットする機会が無くなる。
+#
+# 課金: public リポジトリなら標準ランナーは無料無制限。
+#       private だと Free プランで月2,000分しかなく、この用途には全く足りない。
+
+on:
+  schedule:
+    # cron は UTC。JST = UTC+9。
+    - cron: '20 22 * * *'   # 07:20 JST 開始 → 13:00 JST まで
+    - cron: '50 3 * * *'    # 12:50 JST 開始 → 18:30 JST まで
+    - cron: '20 9 * * *'    # 18:20 JST 開始 → 23:59 JST まで
+  workflow_dispatch:
+    inputs:
+      until:
+        description: '終了時刻 (JST, HH:MM)'
+        required: true
+        default: '23:59'
+
+permissions:
+  contents: write
+
+# 枠が重なっても二重に走らせない。走行中のジョブは殺さない
+# (殺すとコミット前のデータが消える)。
+concurrency:
+  group: collect-odds
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350   # 上限6時間の手前で切る
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 終了時刻を決める
+        id: window
+        run: |
+          case "${{ github.event.schedule }}" in
+            '20 22 * * *') UNTIL='13:00' ;;
+            '50 3 * * *')  UNTIL='18:30' ;;
+            '20 9 * * *')  UNTIL='23:59' ;;
+            *)             UNTIL='${{ github.event.inputs.until }}' ;;
+          esac
+          echo "until=${UNTIL:-23:59}" >> "$GITHUB_OUTPUT"
+          echo "JST $(TZ=Asia/Tokyo date '+%F %H:%M') に開始、${UNTIL} まで収集する"
+
+      - name: オッズを収集する
+        run: |
+          PYTHONPATH=src python -m keirin.collect \
+            --data-root data watch --until '${{ steps.window.outputs.until }}'
+
+      - name: 確定した結果を取り込む
+        # 収集の後で、その日の結果・払戻を1回だけ取る。
+        # 失敗しても収集ぶんは残したいので continue-on-error。
+        continue-on-error: true
+        run: |
+          PYTHONPATH=src python -m keirin.collect --data-root data \
+            results --date "$(TZ=Asia/Tokyo date '+%Y%m%d')"
+
+      - name: 集めたデータをコミットする
+        # always() が要。時間切れやキャンセルで前の手順が落ちても、
+        # そこまでに集めたデータは必ず保存する。
+        if: always()
+        run: |
+          git config user.name  'keirin-collector'
+          git config user.email 'keirin-collector@users.noreply.github.com'
+          git add -f data/raw data/state 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "新しいデータは無し"
+            exit 0
+          fi
+          git commit -m "data: collect odds $(TZ=Asia/Tokyo date '+%F %H:%M') JST"
+          # 別枠のジョブが先にコミットしている場合に備えて rebase してから push
+          for i in 1 2 3; do
+            git pull --rebase --autostash origin "${GITHUB_REF_NAME}" && \
+              git push origin "HEAD:${GITHUB_REF_NAME}" && exit 0
+            echo "push に失敗。${i}回目、少し待って再試行"
+            sleep $((i * 5))
+          done
+          exit 1
+
+      - name: 収集状況を表示する
+        if: always()
+        run: |
+          PYTHONPATH=src python -m keirin.collect --data-root data status --days 3
