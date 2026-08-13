@@ -88,10 +88,19 @@ jobs:
         run: |
           git config user.name  'keirin-collector'
           git config user.email 'keirin-collector@users.noreply.github.com'
-          git add -f data/raw data/state 2>/dev/null || true
+          # 存在するものだけを個別に add する。
+          # `git add -f data/raw data/state` と並べて書くと、片方が無いだけで
+          # pathspec エラーになり **何もステージされない**。しかも add の失敗を
+          # 握り潰していると、そのまま「新しいデータは無し」として成功扱いになる。
+          # 実際にこれで25分ぶんの収集データを捨てた。
+          # watch は data/state を作らない(cron の once だけが作る)。
+          for d in data/raw data/state; do
+            [ -d "$d" ] && git add -f "$d"
+          done
           if git diff --cached --quiet; then
-            echo "新しいデータは無し"
-            exit 0
+            echo "ステージされたものが無い。収集できていないか、add に失敗している"
+            ls -la data 2>/dev/null || echo "data ディレクトリが無い"
+            exit 1
           fi
           git commit -m "data: collect odds $(TZ=Asia/Tokyo date '+%F %H:%M') JST"
           # 素直に push して、弾かれたときだけ追いつく。
